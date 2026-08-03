@@ -178,7 +178,7 @@ static void ct_usage(FILE *out) {
         "    --skip-tags <t>   skip tests carrying any of these tags (comma list)\n"
         "    --filter <text>   run tests whose name contains <text> (repeatable,\n"
         "                      prefix with ! to exclude)\n"
-        "    --match <regex>   run tests whose name matches <regex>\n"
+        "    --match <text>    run tests whose name contains <text> (folded)\n"
         "    --exclude <text>  exclude tests whose name contains <text>\n"
         "    --only            run only tests marked .only\n"
         "\n"

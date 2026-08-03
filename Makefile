@@ -1,8 +1,11 @@
+# ISO C99 by default. Any C99-capable compiler works; override the standard
+# with `make STD=gnu99` if you want GNU extensions.
 CC      ?= cc
-CFLAGS  ?= -std=gnu99 -Wall -Wextra -pedantic -g
+STD     ?= c99
+CFLAGS  ?= -std=$(STD) -Wall -Wextra -pedantic -g
 CFLAGS  += -Wno-missing-field-initializers
 
-.PHONY: all run tap list filter sizes clean
+.PHONY: all strict run tap list filter sizes clean
 
 all: c-test example app app-notest libtest
 
@@ -41,3 +44,7 @@ sizes: example app app-notest
 
 clean:
 	rm -f c-test example app app-notest libtest ctest_preload.so
+
+# Rebuild everything with warnings as errors under ISO C99.
+strict:
+	$(MAKE) clean all CFLAGS="-std=c99 -Wall -Wextra -pedantic -Werror -Wno-missing-field-initializers"

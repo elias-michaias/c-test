@@ -1,11 +1,41 @@
 #ifndef CTEST_H
 #define CTEST_H
 
-#if !(defined(__GNUC__) || defined(__clang__))
-#error "ctest requires GCC or Clang"
+/*
+ * ctest is a single-header test framework written to strict ISO C99 for GCC,
+ * Clang, and TCC. It compiles cleanly under `-std=c99 -Wall -Wextra -pedantic
+ * -Werror`. The only pragmatism is `__typeof__` (a reserved double-underscore
+ * name strict C99 accepts silently) used to derive the parameterized-test case
+ * type, plus `_Pragma` diagnostic push/pop on GCC and Clang. No constructors
+ * and no weak symbols are used, so every feature behaves identically on TCC.
+ *
+ * Tests register explicitly: `it(id, "name", ...)` emits a file-scope record,
+ * and each test file lists its records in a `ctest_suite` array. The header's
+ * `main()` passes that suite to ctest_run(), which provides the --list / --run
+ * protocol for the `c-test` CLI launcher plus a standalone in-process mode.
+ *
+ * Lifecycle hooks (ctest_setup, ctest_teardown, ctest_before_each,
+ * ctest_after_each) default to no-ops. Override one by `#define`-mapping it to
+ * your own function before including this header.
+ *
+ * The runner needs POSIX APIs (timers, signals), so the feature test level is
+ * set below. Define a compatible `_POSIX_C_SOURCE` (or `_GNU_SOURCE`) of your
+ * own before including this header to opt out.
+ *
+ * TCC 0.9.27 notes (spurious, tcc bugs on valid C99): it cannot compile glibc's
+ * <regex.h>, so --match is substring-based and the header never includes it;
+ * and it warns "assignment of read-only location" when a parameterized test's
+ * case table is a large `const` struct (a by-value copy artifact). Both build
+ * cleanly under GCC and Clang.
+ */
+#if !(defined(__GNUC__) || defined(__clang__) || defined(__TINYC__))
+#error "ctest requires GCC, Clang, or TCC"
 #endif
 
 #ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#elif _POSIX_C_SOURCE < 200809L
+#undef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
 
@@ -17,6 +47,12 @@
 #define CT_JOIN(a, b) CT_JOIN_(a, b)
 #define CT_JOIN_(a, b) a##b
 #define CT_NAME(p) CT_JOIN(p, __LINE__)
+
+#if defined(__GNUC__) || defined(__clang__)
+#define CT_UNUSED __attribute__((unused))
+#else
+#define CT_UNUSED
+#endif
 
 /*
  * Preprocessor plumbing used by `it` to detect a trailing `cases(...)` argument
@@ -66,10 +102,6 @@
 #define CT_LAST_ARG(...) CT_ARG_N(CT_NARG(__VA_ARGS__), __VA_ARGS__)
 #define CT_HAS_CASES(...) CT_IS_PAREN(CT_LAST_ARG(__VA_ARGS__))
 
-#define CT_SPEC_IF(...) CT_SPEC_IF_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
-#define CT_SPEC_IF_II(c, ...) CT_CAT(CT_SPEC_IF_, c)(__VA_ARGS__)
-#define CT_REG_IF(...) CT_REG_IF_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
-#define CT_REG_IF_II(c, ...) CT_CAT(CT_REG_IF_, c)(__VA_ARGS__)
 #define CT_SIG_IF(...) CT_SIG_IF_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_SIG_IF_II(c, ...) CT_CAT(CT_SIG_IF_, c)(__VA_ARGS__)
 #define CT_SIG_IF_0(...) (void)
@@ -101,7 +133,7 @@
 /* In non-test builds `it` keeps the array alive via a pointer so clang's
  * -Wunused-const-variable does not flag case tables that are only read here. */
 #define CT_PARAM_USE_0(...)
-#define CT_PARAM_USE_1(...) static __attribute__((unused)) const void *       \
+#define CT_PARAM_USE_1(...) static CT_UNUSED const void *                       \
     CT_NAME(ct_use) = (const void *)CT_PARAM_ARRAY(__VA_ARGS__);
 #define CT_PARAM_USE(...) CT_PARAM_USE_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_PARAM_USE_II(c, ...) CT_CAT(CT_PARAM_USE_, c)(__VA_ARGS__)
@@ -179,10 +211,14 @@ typedef struct ctest_reporter {
  * own main (if any) becomes ctest_app_main instead of shadowing ours.
  */
 
-int ctest_run(int argc, char **argv);
+struct ctest_test;
+
+int ctest_run(int argc, char **argv, const struct ctest_test *const *suite);
+
+extern const struct ctest_test *const ctest_suite[];
 
 int main(int argc, char **argv) {
-    return ctest_run(argc, argv);
+    return ctest_run(argc, argv, ctest_suite);
 }
 
 #define main ctest_app_main
@@ -202,7 +238,6 @@ int main(int argc, char **argv) {
 #define CT_OS "unknown"
 #endif
 
-#include <regex.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -225,53 +260,87 @@ int main(int argc, char **argv) {
  * Because every test runs in its own child process under the c-test runner,
  * setup/teardown run once per child there; in standalone mode they run once
  * per suite.
+ *
+ * Each hook defaults to a no-op. To run your own, map the hook to a function
+ * with a `#define` before including this header and declare that function:
+ *
+ *     #define ctest_before_each my_before_each
+ *     void my_before_each(void);
+ *     #include "ctest.h"
+ *
+ *     void my_before_each(void) { ... }
+ *
+ * Plain C99, no weak symbols: works on GCC, Clang, and TCC.
  */
-void ctest_setup(void) __attribute__((weak));
-void ctest_teardown(void) __attribute__((weak));
-void ctest_before_each(void) __attribute__((weak));
-void ctest_after_each(void) __attribute__((weak));
+#ifndef ctest_setup
+#define ctest_setup ct_noop_setup
+#endif
+#ifndef ctest_teardown
+#define ctest_teardown ct_noop_teardown
+#endif
+#ifndef ctest_before_each
+#define ctest_before_each ct_noop_before_each
+#endif
+#ifndef ctest_after_each
+#define ctest_after_each ct_noop_after_each
+#endif
+
+static void CT_UNUSED ct_noop_setup(void) {}
+static void CT_UNUSED ct_noop_teardown(void) {}
+static void CT_UNUSED ct_noop_before_each(void) {}
+static void CT_UNUSED ct_noop_after_each(void) {}
 
 #if defined(__linux__)
 #include <sys/prctl.h>
-
-static void __attribute__((constructor)) ctest_nodump(void) {
-    prctl(PR_SET_DUMPABLE, 0);
-}
 #endif
 
-void ctest_register(it_t spec, const char *file, int line, void (*fn)(void),
-                    const void *cases_data, size_t cases_elem,
-                    size_t cases_count);
-
 /*
- * Parameterized tests: `cases(array)` is passed as the last `it` argument.
- * `it` derives the case type from the array's element type and declares a
- * by-value `it` struct for the body:
+ * Tests register by listing their records in a `ctest_suite` array, one per
+ * test file, e.g.:
+ *
+ *     const struct ctest_test *const ctest_suite[] = {
+ *         CT_IT(t_multiply),
+ *         CT_IT(t_plain),
+ *         0
+ *     };
+ *
+ * `cases(array)` is passed as the last `it` argument. `it` derives the case
+ * type from the array's element type and declares a by-value `it` struct for
+ * the body:
  *
  *     static const struct { int a, b; } mult_cases[] = { {2, 3}, {3, 4} };
- *     it("multiply", cases(mult_cases)) {
+ *     it(t_multiply, "multiply", cases(mult_cases)) {
  *         expect(it.a * it.b == 6, "multiplication");
  *     }
  *
  * Plain tests take no signature; `it` emits `(void)` automatically:
  *
- *     it("does something") { ... }
+ *     it(t_plain, "does something") { ... }
  *
  * `cases` may be combined with the other `it` options and must be the last
- * argument: it("name", .tags = {"math"}, cases(array)).
+ * argument: it(t_x, "name", .tags = {"math"}, cases(array)).
  */
-#define CT_SPEC_IF_0(...) it_t spec = { __VA_ARGS__ };
-#define CT_SPEC_IF_1(...) it_t spec = { CT_DROP_LAST(__VA_ARGS__) };
+#define CT_SPEC_VALUE_0(...) { __VA_ARGS__ }
+#define CT_SPEC_VALUE_1(...) { CT_DROP_LAST(__VA_ARGS__) }
+#define CT_SPEC_VALUE(...) CT_SPEC_VALUE_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
+#define CT_SPEC_VALUE_II(c, ...) CT_CAT(CT_SPEC_VALUE_, c)(__VA_ARGS__)
 
-#define CT_REG_IF_0(...)                                                     \
-    ctest_register(spec, __FILE__, __LINE__, CT_NAME(ctest_fn), NULL, 0, 0);
-#define CT_REG_IF_1(...) do {                                                \
-    const void *ct_data = (const void *)CT_PARAM_ARRAY(__VA_ARGS__);         \
-    size_t ct_n = CT_PARAM_N(CT_PARAM_ARRAY(__VA_ARGS__));                   \
-    if (ct_n > CT_MAX_PARAM_CASES) ct_n = CT_MAX_PARAM_CASES;                \
-    ctest_register(spec, __FILE__, __LINE__, CT_NAME(ct_call), ct_data,      \
-                   sizeof((CT_PARAM_ARRAY(__VA_ARGS__))[0]), ct_n);          \
-} while (0);
+#define CT_PARAM_DATA_0(...) NULL
+#define CT_PARAM_DATA_1(...) (const void *)CT_PARAM_ARRAY(__VA_ARGS__)
+#define CT_PARAM_DATA(...) CT_PARAM_DATA_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_DATA_II(c, ...) CT_CAT(CT_PARAM_DATA_, c)(__VA_ARGS__)
+
+#define CT_PARAM_ELEM_0(...) 0
+#define CT_PARAM_ELEM_1(...) sizeof((CT_PARAM_ARRAY(__VA_ARGS__))[0])
+#define CT_PARAM_ELEM(...) CT_PARAM_ELEM_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_ELEM_II(c, ...) CT_CAT(CT_PARAM_ELEM_, c)(__VA_ARGS__)
+
+#define CT_PARAM_COUNT_0(...) 0
+#define CT_PARAM_COUNT_1(...) CT_PARAM_N(CT_PARAM_ARRAY(__VA_ARGS__))
+#define CT_PARAM_COUNT(...) CT_PARAM_COUNT_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_COUNT_II(c, ...) CT_CAT(CT_PARAM_COUNT_, c)(__VA_ARGS__)
+
+#define CT_IT(id) (&id##_rec)
 
 /*
  * The `it` macro relies on a prototype-less forward declaration and on
@@ -287,23 +356,30 @@ void ctest_register(it_t spec, const char *file, int line, void (*fn)(void),
     _Pragma("clang diagnostic ignored \"-Wdeprecated-non-prototype\"")       \
     _Pragma("clang diagnostic ignored \"-Wmissing-field-initializers\"")
 #define CT_DIAG_POP _Pragma("clang diagnostic pop")
-#else
+#elif defined(__GNUC__)
 #define CT_DIAG_PUSH                                                         \
     _Pragma("GCC diagnostic push")                                           \
     _Pragma("GCC diagnostic ignored \"-Wmissing-field-initializers\"")
 #define CT_DIAG_POP _Pragma("GCC diagnostic pop")
+#else
+/* TCC (and other compilers without the _Pragma operator): no diagnostics. */
+#define CT_DIAG_PUSH
+#define CT_DIAG_POP
 #endif
 
-#define it(...) CT_DIAG_PUSH                                                 \
+#define it(id, ...) CT_DIAG_PUSH                                             \
     CT_PARAM_TYPEDEF(__VA_ARGS__)                                            \
     static void CT_NAME(ctest_fn)();                                         \
-    static void __attribute__((unused)) CT_NAME(ct_call)(void) {             \
+    static void id##_run(void) {                                             \
         CT_PARAM_CALL(__VA_ARGS__)                                           \
     }                                                                        \
-    static __attribute__((constructor)) void CT_NAME(ctest_reg)(void) {      \
-        CT_SPEC_IF(__VA_ARGS__)                                              \
-        CT_REG_IF(__VA_ARGS__)                                               \
-    }                                                                        \
+    static const struct ctest_test id##_rec = {                              \
+        CT_SPEC_VALUE(__VA_ARGS__),                                          \
+        __FILE__, __LINE__,                                                  \
+        id##_run,                                                            \
+        CT_PARAM_DATA(__VA_ARGS__), CT_PARAM_ELEM(__VA_ARGS__),              \
+        CT_PARAM_COUNT(__VA_ARGS__)                                          \
+    };                                                                       \
     CT_DIAG_POP                                                              \
     static void CT_NAME(ctest_fn) CT_SIG_IF(__VA_ARGS__)
 
@@ -317,27 +393,9 @@ typedef struct ctest_test {
     size_t cases_count;
 } ctest_test;
 
-static ctest_test *g_tests;
+static const struct ctest_test *const *g_tests;
 static size_t g_count;
-static size_t g_cap;
 static const void *g_case_ptr;
-
-void ctest_register(it_t spec, const char *file, int line, void (*fn)(void),
-                    const void *cases_data, size_t cases_elem,
-                    size_t cases_count) {
-    if (g_count == g_cap) {
-        g_cap = g_cap ? g_cap * 2 : 64;
-        g_tests = realloc(g_tests, g_cap * sizeof *g_tests);
-    }
-    g_tests[g_count].spec = spec;
-    g_tests[g_count].file = file;
-    g_tests[g_count].line = line;
-    g_tests[g_count].fn = fn;
-    g_tests[g_count].cases_data = cases_data;
-    g_tests[g_count].cases_elem = cases_elem;
-    g_tests[g_count].cases_count = cases_count;
-    g_count++;
-}
 
 static ctest_failure g_failures[CT_MAX_FAILURES];
 static int g_fail_count;
@@ -364,8 +422,7 @@ void ctest_expect(int ok, const char *file, int line, const char *expr,
 #define CT_EXPECT_2(expr, msg) ctest_expect((expr) != 0, __FILE__, __LINE__, #expr, msg)
 #define expect(...) CT_EXPECT_SELECT(__VA_ARGS__, CT_EXPECT_2, CT_EXPECT_1, 0)(__VA_ARGS__)
 
-static const char *ct_signal_explain(int sig, int st)
-    __attribute__((unused));
+static const char *ct_signal_explain(int sig, int st) CT_UNUSED;
 static const char *ct_signal_explain(int sig, int st) {
     static char buf[128];
     if (WIFSIGNALED(st)) {
@@ -883,7 +940,6 @@ typedef struct ct_opts {
     const char *filters[CT_MAX_FILTERS];
     int nfilters;
     const char *match;
-    regex_t match_re;
     const char *exclude;
     ct_tagq tags;
     const char *tagq_str;
@@ -916,7 +972,7 @@ static void ct_usage(FILE *out) {
         "    --skip-tags <t>   skip tests carrying any of these tags (comma list)\n"
         "    --filter <text>   run tests whose name contains <text> (repeatable,\n"
         "                      prefix with ! to exclude)\n"
-        "    --match <regex>   run tests whose name matches <regex>\n"
+        "    --match <text>    run tests whose name contains <text> (folded)\n"
         "    --exclude <text>  exclude tests whose name contains <text>\n"
         "    --only            run only tests marked .only\n"
         "\n"
@@ -944,7 +1000,7 @@ static void ct_usage(FILE *out) {
         "    c-test                        run every test in this binary\n"
         "    c-test --tags math            run the math suite\n"
         "    c-test --run 'detect primes'  run a single test\n"
-        "    c-test --match 'prime|power'  regex on test names\n"
+        "    c-test --match 'prime'     substring on test names\n"
         "\n"
         "  the c-test CLI launcher drives this binary with --list and --run;\n"
         "  both emit tab-separated machine output.\n");
@@ -972,7 +1028,7 @@ static int ct_matches(const ctest_test *t, const ct_opts *o) {
         }
     }
     if (o->exclude && ct_stristr(name, o->exclude)) return 0;
-    if (o->match && regexec(&o->match_re, name, 0, NULL, 0) != 0) return 0;
+    if (o->match && !ct_stristr(name, o->match)) return 0;
     if (!ct_tagq_match(&o->tags, &t->spec)) return 0;
     if (o->skip_tags) {
         const char *p = o->skip_tags;
@@ -997,7 +1053,7 @@ static void ct_build_sel(const ct_opts *o, size_t **out, size_t *nout) {
     size_t *sel = malloc(cap * sizeof *sel);
     size_t n = 0;
     for (size_t i = 0; i < g_count; i++)
-        if (ct_matches(&g_tests[i], o)) sel[n++] = i;
+        if (ct_matches(g_tests[i], o)) sel[n++] = i;
     *out = sel;
     *nout = n;
 }
@@ -1007,7 +1063,7 @@ static int ct_list(const ct_opts *o) {
     size_t *sel = NULL;
     ct_build_sel(o, &sel, &nsel);
     for (size_t i = 0; i < nsel; i++) {
-        const ctest_test *t = &g_tests[sel[i]];
+        const ctest_test *t = g_tests[sel[i]];
         printf("%s\t%s\t%d\n", t->spec.name, t->file, t->line);
     }
     free(sel);
@@ -1158,7 +1214,7 @@ static int ct_run_one(const char *name, int only_mode) {
     }
     int rc = 2;
     for (size_t i = 0; i < g_count; i++) {
-        const ctest_test *t = &g_tests[i];
+        const ctest_test *t = g_tests[i];
         if (strcmp(t->spec.name, base) != 0) continue;
         if (only >= 0 && (t->cases_count == 0 ||
                           (size_t)only >= t->cases_count)) {
@@ -1176,14 +1232,14 @@ static int ct_run_one(const char *name, int only_mode) {
             goto done;
         }
         g_fail_count = 0;
-        if (ctest_setup) ctest_setup();
-        if (ctest_before_each) ctest_before_each();
+        ctest_setup();
+        ctest_before_each();
         int timed_out = ct_run_body(t, only >= 0 ? (size_t)only : 0,
                                     only >= 0 ? (size_t)only + 1
                                               : t->cases_count,
                                     ct_emit_running);
-        if (ctest_after_each) ctest_after_each();
-        if (ctest_teardown) ctest_teardown();
+        ctest_after_each();
+        ctest_teardown();
         double secs = ct_now() - t0;
         if (timed_out) {
             printf("result\tT\t%.3f\t%s\n", secs, t->spec.name);
@@ -1216,7 +1272,7 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel,
     const ctest_reporter *R = o->quiet ? &ct_quiet : o->tap ? &ct_tap : o->reporter;
     g_name_width = 0;
     for (size_t i = 0; i < nsel; i++) {
-        size_t l = strlen(g_tests[sel[i]].spec.name);
+        size_t l = strlen(g_tests[sel[i]]->spec.name);
         if (l > (size_t)g_name_width) g_name_width = (int)l;
     }
     g_total = (int)nsel;
@@ -1227,10 +1283,10 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel,
     int nslow = 0;
     double t_start = ct_now();
 
-    if (ctest_setup) ctest_setup();
+    ctest_setup();
 
     for (size_t k = 0; k < nsel; k++) {
-        const ctest_test *t = &g_tests[sel[k]];
+        const ctest_test *t = g_tests[sel[k]];
         const char *reason = ct_skip_reason(t, only_mode);
         ctest_result res = {0};
         res.name = t->spec.name;
@@ -1245,10 +1301,9 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel,
         }
         g_fail_count = 0;
         double t0 = ct_now();
-        if (ctest_before_each) ctest_before_each();
+        ctest_before_each();
         int timed_out = ct_run_body(t, 0, t->cases_count, NULL);
-        if (ctest_after_each) ctest_after_each();
-        res.seconds = ct_now() - t0;
+        ctest_after_each();        res.seconds = ct_now() - t0;
         if (timed_out) {
             res.status = CT_TIMEOUT;
         } else if (g_fail_count > 0) {
@@ -1277,7 +1332,7 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel,
         ct_slow_insert(slow, &nslow, t->spec.name, res.seconds);
     }
 
-    if (ctest_teardown) ctest_teardown();
+    ctest_teardown();
 
     double t_end = ct_now();
     ctest_summary sum;
@@ -1295,7 +1350,13 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel,
     return failed > 0 ? 1 : 0;
 }
 
-int ctest_run(int argc, char **argv) {
+int ctest_run(int argc, char **argv, const struct ctest_test *const *suite) {
+#if defined(__linux__)
+    prctl(PR_SET_DUMPABLE, 0);
+#endif
+    g_tests = suite;
+    g_count = 0;
+    while (suite[g_count]) g_count++;
     ct_opts o;
     memset(&o, 0, sizeof o);
     o.reporter = &ct_pretty;
@@ -1350,17 +1411,11 @@ int ctest_run(int argc, char **argv) {
         fprintf(stderr, "c-test: invalid tag query: %s\n", o.tagq_str);
         return 2;
     }
-    if (o.match) {
-        if (regcomp(&o.match_re, o.match, REG_EXTENDED | REG_ICASE) != 0) {
-            fprintf(stderr, "c-test: invalid regex: %s\n", o.match);
-            return 2;
-        }
-    }
 
     int only_mode = o.only;
     if (!only_mode) {
         for (size_t i = 0; i < g_count; i++)
-            if (g_tests[i].spec.only) { only_mode = 1; break; }
+            if (g_tests[i]->spec.only) { only_mode = 1; break; }
     }
 
     if (o.list) return ct_list(&o);
@@ -1393,13 +1448,17 @@ int ctest_run(int argc, char **argv) {
  */
 #define it(...) CT_PARAM_TYPEDEF(__VA_ARGS__)                                \
     CT_PARAM_USE(__VA_ARGS__)                                                \
-    static void __attribute__((unused)) CT_NAME(ctest_fn) CT_SIG_IF(__VA_ARGS__)
+    static void CT_UNUSED CT_NAME(ctest_fn) CT_SIG_IF(__VA_ARGS__)
 #define CT_NCT_SELECT(_1, _2, NAME, ...) NAME
 #define CT_NOP_1(expr) ((void)(0 && (expr)))
 #define CT_NOP_2(expr, msg) ((void)(0 && (expr)))
 #define expect(...) CT_NCT_SELECT(__VA_ARGS__, CT_NOP_2, CT_NOP_1, 0)(__VA_ARGS__)
 #define ct_expect_signal(sig, ...) ((void)(0 && (sig)))
 #define ct_expect_abort(...) ct_expect_signal(SIGABRT, __VA_ARGS__)
+
+/* The suite array is written once per file and must compile here too. */
+struct ctest_test { char ct_unused; };
+#define CT_IT(id) 0
 
 #endif
 
