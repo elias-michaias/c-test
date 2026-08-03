@@ -1,3 +1,4 @@
+// clang-format off
 #define ctest_setup libtest_setup
 #define ctest_before_each libtest_before_each
 #define ctest_after_each libtest_after_each
@@ -248,7 +249,7 @@ it("skipped param", .skip = 1, cases(skip_case, skip_cases))
 typedef struct { int v; } plat_case;
 static const plat_case plat_cases[] = { { 1 }, { 2 } };
 
-it("linux-only param", .platforms = "linux", cases(plat_case, plat_cases))
+it("linux-only param", .platforms = {"linux"}, cases(plat_case, plat_cases))
 {
     expect(it.v > 0, "runs on linux");
 }

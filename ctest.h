@@ -44,8 +44,9 @@
 
 #define CT_VERSION "0.1.0"
 
-#define CT_MAX_TAGS 16
-#define CT_MAX_FAILURES 8
+#define CT_MAX_TAGS      16
+#define CT_MAX_PLATFORMS  8
+#define CT_MAX_FAILURES   8
 
 #define CT_JOIN(a, b) CT_JOIN_(a, b)
 #define CT_JOIN_(a, b) a##b
@@ -169,13 +170,13 @@
 
 typedef struct it_t {
     const char *name;
-    const char *tags[CT_MAX_TAGS];
     int skip;
     int only;
-    const char *platforms;
+    const char *platforms[CT_MAX_PLATFORMS];
     const char *std;
     const char *known;
     int timeout;
+    const char *tags[CT_MAX_TAGS];
 } it_t;
 
 typedef struct ctest_failure {
@@ -306,6 +307,7 @@ int main(int argc, char **argv) {
 
 #ifdef _MSC_VER
 #  define strtok_r strtok_s
+#  define strdup   _strdup
 #endif
 
 /*
@@ -379,8 +381,19 @@ static void CT_UNUSED ct_noop_after_each(void) {}
  * Each `it` expands on a single source line, so two `it()`s on the same line
  * collide. Keep one per line -- the natural style anyway.
  */
-#define CT_SPEC_VALUE_0(...) { __VA_ARGS__ }
-#define CT_SPEC_VALUE_1(...) { CT_DROP_LAST(__VA_ARGS__) }
+/* In C++, aggregate initializers cannot mix positional and designated fields
+ * (even in C++20 where designated initializers are standard). GCC/Clang allow
+ * the mix as an extension; MSVC does not. To stay portable, in C++ mode we
+ * emit the first field (name) as a designated initializer too. */
+#ifdef __cplusplus
+#  define CT_SPEC_FIELDS_I(ct_n_, ...) .name = ct_n_, __VA_ARGS__
+#  define CT_SPEC_FIELDS(...) CT_EXPAND(CT_SPEC_FIELDS_I(__VA_ARGS__))
+#  define CT_SPEC_VALUE_0(...) { CT_EXPAND(CT_SPEC_FIELDS_I(__VA_ARGS__)) }
+#  define CT_SPEC_VALUE_1(...) { CT_EXPAND(CT_SPEC_FIELDS_I(CT_DROP_LAST(__VA_ARGS__))) }
+#else
+#  define CT_SPEC_VALUE_0(...) { __VA_ARGS__ }
+#  define CT_SPEC_VALUE_1(...) { CT_DROP_LAST(__VA_ARGS__) }
+#endif
 #define CT_SPEC_VALUE(...) CT_SPEC_VALUE_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_SPEC_VALUE_II(c, ...) CT_CAT(CT_SPEC_VALUE_, c)(__VA_ARGS__)
 
@@ -458,7 +471,7 @@ static void CT_UNUSED ct_noop_after_each(void) {}
 
 #define it(...) CT_DIAG_PUSH                                                 \
     CT_PARAM_TYPEDEF(__VA_ARGS__)                                            \
-    static void CT_NAME(ctest_fn)();                                         \
+    static void CT_NAME(ctest_fn) CT_SIG_IF(__VA_ARGS__);                   \
     static void CT_NAME(ct_run)(void) {                                      \
         CT_PARAM_CALL(__VA_ARGS__)                                          \
     }                                                                        \
@@ -626,7 +639,7 @@ static int ct_tagq_parse(ct_tagq *q, const char *s) {
             while (*p && *p != '+' && *p != ',' && *p != ' ') p++;
             if (p == st) return -1;
             size_t len = p - st;
-            char *buf = malloc(len + 1);
+            char *buf = (char *)malloc(len + 1);
             memcpy(buf, st, len);
             buf[len] = '\0';
             t->tag = buf;
@@ -655,9 +668,12 @@ static int ct_tagq_match(const ct_tagq *q, const it_t *spec) {
     return 0;
 }
 
-static int ct_platform_ok(const char *req) {
-    if (!req) return 1;
-    return strstr(req, CT_OS) != NULL;
+static int ct_platform_ok(const char * const *plats) {
+    if (!plats[0]) return 1;
+    for (int i = 0; i < CT_MAX_PLATFORMS && plats[i]; i++)
+        if (strstr(CT_OS, plats[i]) || strstr(plats[i], CT_OS))
+            return 1;
+    return 0;
 }
 
 static long ct_have_std(void) {
@@ -696,13 +712,22 @@ static int ct_std_ok(const char *req) {
     return ct_have_std() == need && ct_have_gnu() == gnu;
 }
 
-static char g_reason[64];
+static char g_reason[128];
 
 static const char *ct_skip_reason(const ctest_test *t, int only_mode) {
     if (t->spec.skip) return "skipped";
     if (only_mode && !t->spec.only) return "only-mode";
     if (!ct_platform_ok(t->spec.platforms)) {
-        snprintf(g_reason, sizeof g_reason, "requires %s", t->spec.platforms);
+        int n = 0;
+        char *p = g_reason;
+        int rem = (int)sizeof g_reason;
+        int w = snprintf(p, (size_t)rem, "requires ");
+        p += w; rem -= w;
+        for (int i = 0; i < CT_MAX_PLATFORMS && t->spec.platforms[i]; i++) {
+            if (n++) { w = snprintf(p, (size_t)rem, " or "); p += w; rem -= w; }
+            w = snprintf(p, (size_t)rem, "%s", t->spec.platforms[i]);
+            p += w; rem -= w;
+        }
         return g_reason;
     }
     if (!ct_std_ok(t->spec.std)) {
@@ -1108,7 +1133,8 @@ static void ct_usage(FILE *out) {
         "    .tags = { \"math\", \"fast\" }  tag the test\n"
         "    .only = 1              run only this test (with --only)\n"
         "    .skip = 1              always skip\n"
-        "    .platforms = \"linux\"    only run on matching platforms\n"
+        "    .platforms = {\"linux\"}              only run on listed platforms\n"
+        "    .platforms = {\"linux\",\"windows\"}   run on any of the listed platforms\n"
         "    .known = \"JIRA-123\"    expected failure; counts as known, not failed\n"
         "    .timeout = <ms>        abort the test after <ms> milliseconds\n"
         "\n"
@@ -1178,7 +1204,7 @@ static int ct_matches(const ctest_test *t, const ct_opts *o) {
 
 static void ct_build_sel(const ct_opts *o, size_t **out, size_t *nout) {
     size_t cap = g_count ? g_count : 1;
-    size_t *sel = malloc(cap * sizeof *sel);
+    size_t *sel = (size_t *)malloc(cap * sizeof *sel);
     size_t n = 0;
     for (size_t i = 0; i < g_count; i++)
         if (ct_matches(g_tests[i], o)) sel[n++] = i;
@@ -1205,7 +1231,7 @@ static int ct_list(const ct_opts *o) {
  */
 static char *ct_case_desc(const char *bytes, size_t n) {
     size_t shown = n < 16 ? n : 16;
-    char *buf = malloc(shown * 3 + 4);
+    char *buf = (char *)malloc(shown * 3 + 4);
     size_t k = 0;
     for (size_t i = 0; i < shown; i++) {
         if (i) buf[k++] = ' ';
@@ -1276,7 +1302,7 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
     if (to > t->cases_count) to = t->cases_count;
     if (from > to) from = to;
     g_case_desc_n = to - from;
-    g_case_descs = g_case_desc_n ? malloc(g_case_desc_n * sizeof *g_case_descs) : NULL;
+    g_case_descs = g_case_desc_n ? (char **)malloc(g_case_desc_n * sizeof *g_case_descs) : NULL;
     for (size_t j = from; j < to; j++) {
         g_case_descs[j - from] = ct_case_desc(
             (const char *)t->cases_data + j * t->cases_elem, t->cases_elem);
@@ -1344,7 +1370,7 @@ static int ct_run_one(const char *name, int only_mode) {
             if (*end == ']') {
                 only = (int)v;
                 blen = (size_t)(lb - name) - 1;
-                char *nb = malloc(blen + 1);
+                char *nb = (char *)malloc(blen + 1);
                 memcpy(nb, name, blen);
                 nb[blen] = '\0';
                 free(base);

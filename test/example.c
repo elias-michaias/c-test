@@ -44,12 +44,12 @@ it("should print mismatched values", .tags = {"demo"})
     expect(add(1, 2) == 4);
 }
 
-it("should be close to floating values", .platforms = "linux", .tags = {"math"})
+it("should be close to floating values", .platforms = {"linux"}, .tags = {"math"})
 {
     expect(0.1 + 0.2 > 0.3);
 }
 
-it("should check ranges", .platforms = "linux", .tags = {"math"})
+it("should check ranges", .platforms = {"linux"}, .tags = {"math"})
 {
     expect(7 >= 1 && 7 <= 10);
 }
@@ -71,7 +71,7 @@ it("should sleep briefly", .tags = {"slow"})
     expect(1 == 1);
 }
 
-it("should run only on windows", .platforms = "windows")
+it("should run only on windows", .platforms = {"windows"})
 {
     expect(1);
 }
