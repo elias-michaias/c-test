@@ -75,7 +75,18 @@ static void ct_setup_child(void) {
 static int ct_color(void) {
     static int v = -1;
 #ifdef _WIN32
-    if (v < 0) v = _isatty(_fileno(stdout));
+    if (v < 0) {
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode = 0;
+        /* Enable VT processing; if it fails, disable color entirely so ANSI
+           escape codes are not printed as garbage characters. */
+        if (GetConsoleMode(h, &mode) &&
+            SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+            v = 1;
+        } else {
+            v = 0;
+        }
+    }
 #else
     if (v < 0) v = isatty(fileno(stdout));
 #endif
