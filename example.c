@@ -1,5 +1,6 @@
 #include "ctest.h"
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static int add(int a, int b) {
@@ -59,7 +60,8 @@ it("should compute powers", .tags = {"math", "fast"})
 
 it("should sleep briefly", .tags = {"slow"})
 {
-    usleep(120000);
+    struct timespec ts = { 0, 120000000L };
+    nanosleep(&ts, NULL);
     expect(1 == 1);
 }
 

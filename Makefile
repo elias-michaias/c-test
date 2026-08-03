@@ -1,37 +1,43 @@
 CC      ?= cc
-CFLAGS  ?= -std=gnu11 -Wall -Wextra -pedantic -g
+CFLAGS  ?= -std=gnu99 -Wall -Wextra -pedantic -g
 CFLAGS  += -Wno-missing-field-initializers
 
 .PHONY: all run tap list filter sizes clean
 
-all: example app app-notest
+all: c-test example app app-notest libtest
 
-example: example.c ctest.c ctest.h
-	$(CC) $(CFLAGS) -DCTEST -o $@ example.c ctest.c
+c-test: ctest.c ctest.h
+	$(CC) $(CFLAGS) -o $@ ctest.c
 
-app: app.c ctest.c ctest.h
-	$(CC) $(CFLAGS) -DCTEST -o $@ app.c ctest.c
+example: example.c ctest.h
+	$(CC) $(CFLAGS) -DCTEST -o $@ example.c
 
-crash: crash.c ctest.c ctest.h
-	$(CC) $(CFLAGS) -DCTEST -o $@ crash.c ctest.c
+app: app.c ctest.h
+	$(CC) $(CFLAGS) -DCTEST -o $@ app.c
+
+crash: crash.c ctest.h
+	$(CC) $(CFLAGS) -DCTEST -o $@ crash.c
+
+libtest: libtest.c ctest.h
+	$(CC) $(CFLAGS) -DCTEST -o $@ libtest.c
 
 app-notest: app.c ctest.h
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ app.c
 
-run: example
-	./example
+run: c-test example
+	./c-test ./example
 
-tap: example
-	./example --tap
+tap: c-test example
+	./c-test ./example --tap
 
-list: example
-	./example --list
+list: c-test example
+	./c-test ./example --list
 
-filter: example
-	./example --filter primes
+filter: c-test example
+	./c-test ./example --filter primes
 
 sizes: example app app-notest
 	@size example app app-notest
 
 clean:
-	rm -f example app-notest
+	rm -f c-test example app app-notest libtest ctest_preload.so
