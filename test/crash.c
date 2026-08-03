@@ -1,6 +1,8 @@
 #include "ctest.h"
 #include <stdlib.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 it("should segfault", .tags = {"crash"})
 {

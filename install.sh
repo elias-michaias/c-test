@@ -12,8 +12,8 @@ inc_dir="${HOME}/.local/include"
 
 mkdir -p "$bin_dir" "$inc_dir"
 
-install -m 755 "$dir/c-test" "$bin_dir/c-test"
 install -m 644 "$dir/ctest.h" "$inc_dir/ctest.h"
+install -m 755 "$dir/c-test" "$bin_dir/c-test"
 
 echo "installed $bin_dir/c-test"
 echo "installed $inc_dir/ctest.h"

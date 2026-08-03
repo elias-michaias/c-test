@@ -33,11 +33,13 @@
 #error "ctest requires GCC, Clang, or MSVC"
 #endif
 
-#ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 200809L
-#elif _POSIX_C_SOURCE < 200809L
-#undef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 200809L
+#ifndef _MSC_VER
+#  ifndef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#  elif _POSIX_C_SOURCE < 200809L
+#    undef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#  endif
 #endif
 
 #define CT_VERSION "0.1.0"
@@ -65,9 +67,17 @@
  */
 #define CT_PROBE() ~, 1,
 #define CT_CHECK_N(x, n, ...) n
-#define CT_CHECK(...) CT_CHECK_N(__VA_ARGS__, 0,)
+#define CT_CHECK(...) CT_EXPAND(CT_CHECK_N(__VA_ARGS__, 0,))
 #define CT_IS_PAREN_PROBE(...) CT_PROBE()
 #define CT_IS_PAREN(x) CT_CHECK(CT_IS_PAREN_PROBE x)
+
+/* CT_EXPAND(x) x — forces a second prescan pass.
+ * MSVC's legacy preprocessor treats __VA_ARGS__ as a single token when
+ * forwarded to a nested macro call.  Wrapping the call in CT_EXPAND causes
+ * MSVC to rescan the result and properly split __VA_ARGS__ commas into
+ * separate arguments.  This is a standard C99 no-op on conformant
+ * preprocessors (GCC, Clang) and is NOT a compiler-specific extension. */
+#define CT_EXPAND(x) x
 
 #define CT_DE1(...) __VA_ARGS__
 #define CT_DE(t) CT_DE1 t
@@ -75,7 +85,7 @@
 #define CT_CAT(a, ...) CT_CAT_I(a, __VA_ARGS__)
 #define CT_CAT_I(a, ...) a##__VA_ARGS__
 
-#define CT_NARG(...) CT_NARG_I(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#define CT_NARG(...)   CT_EXPAND(CT_NARG_I(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0))
 #define CT_NARG_I(_1, _2, _3, _4, _5, _6, _7, _8, N, ...) N
 
 #define CT_ARG_1(a) a
@@ -86,8 +96,8 @@
 #define CT_ARG_6(a, b, c, d, e, f) f
 #define CT_ARG_7(a, b, c, d, e, f, g) g
 #define CT_ARG_8(a, b, c, d, e, f, g, h) h
-#define CT_ARG_N(n, ...) CT_ARG_N_I(CT_CAT(CT_ARG_, n), __VA_ARGS__)
-#define CT_ARG_N_I(name, ...) name(__VA_ARGS__)
+#define CT_ARG_N(n, ...) CT_EXPAND(CT_ARG_N_I(CT_CAT(CT_ARG_, n), __VA_ARGS__))
+#define CT_ARG_N_I(name, ...) CT_EXPAND(name(__VA_ARGS__))
 
 #define CT_DROP_LAST_1(a)
 #define CT_DROP_LAST_2(a, b) a
@@ -97,8 +107,8 @@
 #define CT_DROP_LAST_6(a, b, c, d, e, f) a, b, c, d, e
 #define CT_DROP_LAST_7(a, b, c, d, e, f, g) a, b, c, d, e, f
 #define CT_DROP_LAST_8(a, b, c, d, e, f, g, h) a, b, c, d, e, f, g
-#define CT_DROP_LAST(...) CT_DROP_LAST_I(CT_CAT(CT_DROP_LAST_, CT_NARG(__VA_ARGS__)), __VA_ARGS__)
-#define CT_DROP_LAST_I(name, ...) name(__VA_ARGS__)
+#define CT_DROP_LAST(...) CT_EXPAND(CT_DROP_LAST_I(CT_CAT(CT_DROP_LAST_, CT_NARG(__VA_ARGS__)), __VA_ARGS__))
+#define CT_DROP_LAST_I(name, ...) CT_EXPAND(name(__VA_ARGS__))
 
 #define CT_LAST_ARG(...) CT_ARG_N(CT_NARG(__VA_ARGS__), __VA_ARGS__)
 #define CT_HAS_CASES(...) CT_IS_PAREN(CT_LAST_ARG(__VA_ARGS__))
@@ -112,14 +122,27 @@
 #define CT_PARAM_N(array) (sizeof(array) / sizeof((array)[0]))
 
 /*
- * Parameterized tests: `cases(array)` is passed as the last `it` argument and
- * expands to the bare parenthesized array, so the trailing-parenthesis probe
- * above still identifies it. `it` derives the case type from the array element
- * type with __typeof__ and declares a by-value `it` struct for the body.
+ * Parameterized tests: `cases(type, array)` is passed as the last `it` argument
+ * and expands to a parenthesised pair so the trailing-parenthesis probe above
+ * still identifies it. `it` uses the explicit `type` to declare a by-value `it`
+ * struct for the body — no `__typeof__` needed (MSVC compatible).
  */
-#define cases(array) (array)
+/* cases(type, array) — explicit element type avoids __typeof__ (MSVC compat).
+ * Expands to (type, array) so the IS_PAREN probe still fires.
+ *
+ * Extraction: CT_PARAM_TYPE/ARRAY_WRAP(paren) takes the parenthesised pair as
+ * a single argument.  After substitution the replacement list becomes
+ * CT_CASES_*_I (type, array), which the rescan then recognises as a
+ * function-like call — no __VA_ARGS__ comma-splitting tricks needed, works
+ * with MSVC's legacy preprocessor as well as GCC and Clang. */
+#define cases(type, array) (type, array)
 
-#define CT_PARAM_ARRAY(...) CT_DE(CT_LAST_ARG(__VA_ARGS__))
+#define CT_CASES_TYPE_I(type, array)  type
+#define CT_CASES_ARRAY_I(type, array) array
+#define CT_PARAM_TYPE_WRAP(paren)   CT_CASES_TYPE_I  paren
+#define CT_PARAM_ARRAY_WRAP(paren)  CT_CASES_ARRAY_I paren
+#define CT_PARAM_TYPE(...)   CT_PARAM_TYPE_WRAP(CT_LAST_ARG(__VA_ARGS__))
+#define CT_PARAM_ARRAY(...)  CT_PARAM_ARRAY_WRAP(CT_LAST_ARG(__VA_ARGS__))
 
 #define CT_PARAM_TYPEDEF_0(...)
 #define CT_PARAM_TYPEDEF_1(...)                                             \
@@ -127,7 +150,7 @@
         [(CT_PARAM_N(CT_PARAM_ARRAY(__VA_ARGS__)) > 0 &&                    \
           CT_PARAM_N(CT_PARAM_ARRAY(__VA_ARGS__)) <= CT_MAX_PARAM_CASES)    \
              ? 1 : -1];                                                     \
-    typedef __typeof__(*(CT_PARAM_ARRAY(__VA_ARGS__))) CT_NAME(ct_param);
+    typedef CT_PARAM_TYPE(__VA_ARGS__) CT_NAME(ct_param);
 #define CT_PARAM_TYPEDEF(...) CT_PARAM_TYPEDEF_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_PARAM_TYPEDEF_II(c, ...) CT_CAT(CT_PARAM_TYPEDEF_, c)(__VA_ARGS__)
 
@@ -233,15 +256,22 @@ int main(int argc, char **argv) {
  *     retained even under `--gc-sections`.
  *   - Mach-O: equivalent `section$start$__DATA$<section>` /
  *     `section$end$__DATA$<section>` asm-derived labels.
- *
- * MSVC PE has no equivalent sentinel and needs its own walker; pending.
+ *   - MSVC PE: no sentinel; use the sub-section alpha-sort trick. Records are
+ *     stored as *pointers* in "ct_tst$b"; NULL sentinels sit in "ct_tst$a"
+ *     and "ct_tst$z". The linker merges them in ASCII order, so $a < $b < $z.
  */
 #if defined(__APPLE__)
 #define CT_SECTION_NAME "__DATA,ct_tst"
+#elif defined(_MSC_VER)
+#pragma section("ct_tst$a", read)
+#pragma section("ct_tst$b", read)
+#pragma section("ct_tst$z", read)
+#define CT_SECTION_NAME "ct_tst$b"
+#define CT_SECTION_MSVC 1
 #elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__))
 #define CT_SECTION_NAME "ct_tst"
 #else
-#error "ctest open-world registration needs GNU ELF (gcc/clang) or Mach-O. MSVC PE support is pending."
+#error "ctest requires GCC/Clang (ELF or Mach-O) or MSVC."
 #endif
 
 #define CT_MAX_FILTERS 8
@@ -264,10 +294,19 @@ int main(int argc, char **argv) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
-#include <sys/wait.h>
 #include <time.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  include <windows.h>
+#  include <io.h>      /* _isatty, _fileno */
+#else
+#  include <sys/time.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
+
+#ifdef _MSC_VER
+#  define strtok_r strtok_s
+#endif
 
 /*
  * Optional lifecycle hooks. Define any (or all) of these in your test file
@@ -379,9 +418,42 @@ static void CT_UNUSED ct_noop_after_each(void) {}
     _Pragma("GCC diagnostic push")                                           \
     _Pragma("GCC diagnostic ignored \"-Wmissing-field-initializers\"")
 #define CT_DIAG_POP _Pragma("GCC diagnostic pop")
+#elif defined(_MSC_VER)
+/* C4204: non-constant aggregate initializer (designated init of it_t.tags) */
+#define CT_DIAG_PUSH __pragma(warning(push)) __pragma(warning(disable:4204))
+#define CT_DIAG_POP  __pragma(warning(pop))
 #else
 #define CT_DIAG_PUSH
 #define CT_DIAG_POP
+#endif
+
+/*
+ * CT_REGISTER places the ctest_test record into the section. On ELF/Mach-O the
+ * struct itself lives in the section (walked by pointer arithmetic). On MSVC PE
+ * the struct lives in normal BSS/data and a *pointer* to it is placed in the
+ * "ct_tst$b" sub-section; the walker dereferences each pointer.
+ */
+#ifdef CT_SECTION_MSVC
+#define CT_REGISTER(...)                                                     \
+    static const struct ctest_test CT_NAME(ct_rec) = {                      \
+        CT_SPEC_VALUE(__VA_ARGS__),                                          \
+        __FILE__, __LINE__,                                                  \
+        CT_NAME(ct_run),                                                     \
+        CT_PARAM_DATA(__VA_ARGS__), CT_PARAM_ELEM(__VA_ARGS__),              \
+        CT_PARAM_COUNT(__VA_ARGS__)                                          \
+    };                                                                       \
+    __declspec(allocate("ct_tst$b")) static const struct ctest_test *        \
+        CT_NAME(ct_ptr) = &CT_NAME(ct_rec);
+#else
+#define CT_REGISTER(...)                                                     \
+    static const struct ctest_test CT_NAME(ct_rec)                           \
+        __attribute__((used, section(CT_SECTION_NAME))) = {                  \
+        CT_SPEC_VALUE(__VA_ARGS__),                                          \
+        __FILE__, __LINE__,                                                  \
+        CT_NAME(ct_run),                                                     \
+        CT_PARAM_DATA(__VA_ARGS__), CT_PARAM_ELEM(__VA_ARGS__),              \
+        CT_PARAM_COUNT(__VA_ARGS__)                                          \
+    };
 #endif
 
 #define it(...) CT_DIAG_PUSH                                                 \
@@ -390,14 +462,7 @@ static void CT_UNUSED ct_noop_after_each(void) {}
     static void CT_NAME(ct_run)(void) {                                      \
         CT_PARAM_CALL(__VA_ARGS__)                                          \
     }                                                                        \
-    static const struct ctest_test CT_NAME(ct_rec)                            \
-        __attribute__((used, section(CT_SECTION_NAME))) = {                  \
-        CT_SPEC_VALUE(__VA_ARGS__),                                          \
-        __FILE__, __LINE__,                                                  \
-        CT_NAME(ct_run),                                                     \
-        CT_PARAM_DATA(__VA_ARGS__), CT_PARAM_ELEM(__VA_ARGS__),               \
-        CT_PARAM_COUNT(__VA_ARGS__)                                          \
-    };                                                                       \
+    CT_REGISTER(__VA_ARGS__)                                                 \
     CT_DIAG_POP                                                              \
     static void CT_NAME(ctest_fn) CT_SIG_IF(__VA_ARGS__)
 
@@ -422,6 +487,10 @@ extern const struct ctest_test section$start$__DATA$ct_tst;
 extern const struct ctest_test section$end$__DATA$ct_tst;
 #define CT_SEC_START ((const struct ctest_test *)&section$start$__DATA$ct_tst)
 #define CT_SEC_STOP  ((const struct ctest_test *)&section$end$__DATA$ct_tst)
+#elif defined(CT_SECTION_MSVC)
+/* Sentinel pointers at sub-section boundaries; the walker reads [start+1, stop). */
+__declspec(allocate("ct_tst$a")) static const struct ctest_test *ct_msvc_sec_start = NULL;
+__declspec(allocate("ct_tst$z")) static const struct ctest_test *ct_msvc_sec_stop  = NULL;
 #elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__))
 extern const struct ctest_test __start_ct_tst[];
 extern const struct ctest_test __stop_ct_tst[];
@@ -458,6 +527,7 @@ void ctest_expect(int ok, const char *file, int line, const char *expr,
 #define CT_EXPECT_2(expr, msg) ctest_expect((expr) != 0, __FILE__, __LINE__, #expr, msg)
 #define expect(...) CT_EXPECT_SELECT(__VA_ARGS__, CT_EXPECT_2, CT_EXPECT_1, 0)(__VA_ARGS__)
 
+#ifndef _WIN32
 static const char *ct_signal_explain(int sig, int st) CT_UNUSED;
 static const char *ct_signal_explain(int sig, int st) {
     static char buf[128];
@@ -474,7 +544,7 @@ static const char *ct_signal_explain(int sig, int st) {
     return buf;
 }
 
-#define ct_expect_signal(sig, ...) do {                                    \
+#define expect_signal(sig, ...) do {                                       \
     pid_t ct_pid = fork();                                                 \
     if (ct_pid < 0) {                                                      \
         expect(0, "fork() failed");                                        \
@@ -491,7 +561,12 @@ static const char *ct_signal_explain(int sig, int st) {
            ct_signal_explain((sig), ct_st));                               \
 } while (0)
 
-#define ct_expect_abort(...) ct_expect_signal(SIGABRT, __VA_ARGS__)
+#define expect_abort(...) expect_signal(SIGABRT, __VA_ARGS__)
+
+#else  /* _WIN32: fork() unavailable; signal-based tests are skipped */
+#define expect_signal(sig, ...) ((void)(sig))
+#define expect_abort(...)       ((void)0)
+#endif /* _WIN32 */
 
 static int ct_stristr(const char *hay, const char *needle) {
     size_t nh = strlen(hay), nn = strlen(needle);
@@ -638,16 +713,25 @@ static const char *ct_skip_reason(const ctest_test *t, int only_mode) {
 }
 
 static double ct_now(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
 }
 
 /*
- * Per-test timeouts (`.timeout = <ms>`). The test body runs with a real-time
- * interval timer armed; if it fires we longjmp back to the runner and report
- * the test as timed out. Timer helpers are no-ops when no timeout is set.
+ * Per-test timeouts (`.timeout = <ms>`). On POSIX, the test body runs with a
+ * real-time interval timer armed; if it fires we longjmp back. On Windows,
+ * per-test timeouts are not supported (the c-test launcher enforces its own
+ * global --timeout via TerminateProcess instead).
  */
+#ifndef _WIN32
 static sigjmp_buf ct_alarm_jb;
 
 static void ct_alarm_h(int sig) {
@@ -675,6 +759,10 @@ static void ct_timeout_stop(void) {
     setitimer(ITIMER_REAL, &iv, NULL);
     signal(SIGALRM, SIG_DFL);
 }
+#else  /* _WIN32 */
+static void ct_timeout_start(int ms) { (void)ms; }
+static void ct_timeout_stop(void)    {}
+#endif /* _WIN32 */
 
 static unsigned g_rng = 0x9e3779b9u;
 
@@ -733,7 +821,11 @@ static int g_force_no_color;
 
 static int ct_color(void) {
     static int v = -1;
+#ifdef _WIN32
+    if (v < 0) v = _isatty(_fileno(stdout));
+#else
     if (v < 0) v = isatty(fileno(stdout));
+#endif
     if (g_force_no_color) v = 0;
     return v;
 }
@@ -1155,6 +1247,11 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
         g_cur_case = -1;
         g_cur_case_desc = NULL;
         g_case_ptr = NULL;
+#ifdef _WIN32
+        ct_timeout_start(t->spec.timeout);
+        t->fn();
+        ct_timeout_stop();
+#else
         if (sigsetjmp(ct_alarm_jb, 1) == 0) {
             ct_timeout_start(t->spec.timeout);
             t->fn();
@@ -1173,6 +1270,7 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
             }
             g_fail_count++;
         }
+#endif
         return timed_out;
     }
     if (to > t->cases_count) to = t->cases_count;
@@ -1187,6 +1285,11 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
         g_cur_case_desc = g_case_descs[j - from];
         g_case_ptr = (const char *)t->cases_data + j * t->cases_elem;
         int to2 = 0;
+#ifdef _WIN32
+        ct_timeout_start(t->spec.timeout);
+        t->fn();
+        ct_timeout_stop();
+#else
         if (sigsetjmp(ct_alarm_jb, 1) == 0) {
             ct_timeout_start(t->spec.timeout);
             t->fn();
@@ -1195,6 +1298,7 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
             ct_timeout_stop();
             to2 = 1;
         }
+#endif
         if (to2) {
             timed_out = 1;
             if (g_fail_count < CT_MAX_FAILURES) {
@@ -1392,6 +1496,26 @@ int ctest_run(int argc, char **argv) {
 #endif
     g_tests = NULL;
     g_count = 0;
+#ifdef CT_SECTION_MSVC
+    {
+        /* Walk pointer array in [ct_msvc_sec_start+1, ct_msvc_sec_stop). */
+        const struct ctest_test * const *pp = &ct_msvc_sec_start + 1;
+        const struct ctest_test * const *pe = &ct_msvc_sec_stop;
+        size_t cap = 64;
+        g_tests = (const struct ctest_test **)malloc(cap * sizeof *g_tests);
+        if (!g_tests) { fprintf(stderr, "ctest: out of memory\n"); return 2; }
+        for (; pp < pe; pp++) {
+            if (!*pp) continue;
+            if (g_count >= cap) {
+                cap *= 2;
+                g_tests = (const struct ctest_test **)realloc(
+                    g_tests, cap * sizeof *g_tests);
+                if (!g_tests) { fprintf(stderr, "ctest: out of memory\n"); return 2; }
+            }
+            g_tests[g_count++] = *pp;
+        }
+    }
+#else
     {
         size_t n = (size_t)(CT_SEC_STOP - CT_SEC_START);
         if (n) {
@@ -1401,6 +1525,7 @@ int ctest_run(int argc, char **argv) {
             g_count = n;
         }
     }
+#endif
     ct_opts o;
     memset(&o, 0, sizeof o);
     o.reporter = &ct_pretty;
@@ -1497,8 +1622,8 @@ int ctest_run(int argc, char **argv) {
 #define CT_NOP_1(expr) ((void)(0 && (expr)))
 #define CT_NOP_2(expr, msg) ((void)(0 && (expr)))
 #define expect(...) CT_NCT_SELECT(__VA_ARGS__, CT_NOP_2, CT_NOP_1, 0)(__VA_ARGS__)
-#define ct_expect_signal(sig, ...) ((void)(0 && (sig)))
-#define ct_expect_abort(...) ct_expect_signal(SIGABRT, __VA_ARGS__)
+#define expect_signal(sig, ...) ((void)(0 && (sig)))
+#define expect_abort(...) expect_signal(SIGABRT, __VA_ARGS__)
 
 #endif
 

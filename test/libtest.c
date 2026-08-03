@@ -34,24 +34,24 @@ static const mult_case mult_cases[] = {
     { -1, 5, -5 },
 };
 
-it("multiply", cases(mult_cases))
+it("multiply", cases(mult_case, mult_cases))
 {
     expect(it.a * it.b == it.product, "multiplication");
 }
 
-it("ct_expect_abort catches abort", .tags = {"sig"})
+it("expect_abort catches abort", .tags = {"sig"})
 {
-    ct_expect_abort({ abort(); });
+    expect_abort({ abort(); });
 }
 
-it("ct_expect_signal catches segfault", .tags = {"sig"})
+it("expect_signal catches segfault", .tags = {"sig"})
 {
-    ct_expect_signal(SIGSEGV, { *(volatile int *)0 = 1; });
+    expect_signal(SIGSEGV, { *(volatile int *)0 = 1; });
 }
 
 it("no signal reported as failure", .tags = {"sig", "broken"})
 {
-    ct_expect_abort({ });
+    expect_abort({ });
 }
 
 it("hooks run before the body", .tags = {"hooks"})
@@ -89,18 +89,15 @@ it("times out", .timeout = 100)
 /* ---------------------------------------------------------------- */
 /* parameterized cases: exhaustive coverage                          */
 /* ---------------------------------------------------------------- */
-static const struct {
-    int input;
-    int expected;
-    const char *label;
-} add_cases[] = {
+typedef struct { int input; int expected; const char *label; } add_case;
+static const add_case add_cases[] = {
     { 1, 2, "one" },
     { 2, 4, "two" },
     { 40, 80, "forty" },
     { -5, -10, "negative" },
 };
 
-it("double input", .tags = {"param", "math"}, cases(add_cases))
+it("double input", .tags = {"param", "math"}, cases(add_case, add_cases))
 {
     expect(it.input * 2 == it.expected, "doubling");
     expect(it.label[0] != '\0', "label present");
@@ -109,7 +106,7 @@ it("double input", .tags = {"param", "math"}, cases(add_cases))
 /* primitive element type: `it` is a plain int */
 static const int prime_samples[] = { 2, 3, 5, 7, 11, 13, 17, 19 };
 
-it("prime samples", cases(prime_samples))
+it("prime samples", cases(int, prime_samples))
 {
     expect(it > 1 && (it == 2 || it % 2 == 1), "odd, or exactly two");
 }
@@ -117,34 +114,33 @@ it("prime samples", cases(prime_samples))
 /* a single-element table: one aggregate entry with one case */
 static const int one_case[] = { 42 };
 
-it("single case", cases(one_case))
+it("single case", cases(int, one_case))
 {
     expect(it == 42, "the only case");
 }
 
 /* designated initializers in the table */
-static const struct { int a; int b; int sum; } di_cases[] = {
+typedef struct { int a; int b; int sum; } di_case;
+static const di_case di_cases[] = {
     { .a = 1, .b = 2, .sum = 3 },
     { .a = -7, .b = 7, .sum = 0 },
     { .a = 100, .b = 200, .sum = 300 },
 };
 
-it("designated cases", cases(di_cases))
+it("designated cases", cases(di_case, di_cases))
 {
     expect(it.a + it.b == it.sum, "sum of designators");
 }
 
 /* non-const table with string + size_t fields */
-static const struct {
-    const char *word;
-    size_t len;
-} words[] = {
+typedef struct { const char *word; size_t len; } word_case;
+static const word_case words[] = {
     { "one", 3 },
     { "four", 4 },
     { "eight", 5 },
 };
 
-it("words", cases(words))
+it("words", cases(word_case, words))
 {
     expect(strlen(it.word) == it.len, "word length");
 }
@@ -152,7 +148,7 @@ it("words", cases(words))
 /* the body receives a by-value copy; mutating it must not touch the table */
 static int mutable_cases[] = { 7, 8, 9 };
 
-it("body copies, array untouched", cases(mutable_cases))
+it("body copies, array untouched", cases(int, mutable_cases))
 {
     it = 0;
     expect(it == 0 && mutable_cases[0] == 7 && mutable_cases[1] == 8 &&
@@ -165,19 +161,20 @@ typedef enum { CT_E_RED = 1, CT_E_GREEN = 2, CT_E_BLUE = 4 } ct_rgb_t;
 
 static const ct_rgb_t color_cases[] = { CT_E_RED, CT_E_GREEN, CT_E_BLUE };
 
-it("enum cases", cases(color_cases))
+it("enum cases", cases(ct_rgb_t, color_cases))
 {
     expect(it == 1 || it == 2 || it == 4, "a valid color");
 }
 
 /* floating-point fields (struct larger than an int, covers sizeof stepping) */
-static const struct { double a; double b; double product; } fp_cases[] = {
+typedef struct { double a; double b; double product; } fp_case;
+static const fp_case fp_cases[] = {
     { 0.5, 2.0, 1.0 },
     { 1.5, 4.0, 6.0 },
     { -2.25, 4.0, -9.0 },
 };
 
-it("float cases", cases(fp_cases))
+it("float cases", cases(fp_case, fp_cases))
 {
     expect(it.a * it.b == it.product, "fp product");
 }
@@ -194,7 +191,7 @@ static const big_case big_cases[] = {
     { 2, "beta", { -1.0, 3.0 } },
 };
 
-it("big cases", cases(big_cases))
+it("big cases", cases(big_case, big_cases))
 {
     expect(it.buf[0] == 'a' || it.buf[0] == 'b', "name prefix");
     expect(it.vals[0] + it.vals[1] != 0.0, "vals sum to a non-zero total");
@@ -205,67 +202,74 @@ typedef struct { int v; } trap_case;
 
 static const trap_case trap_cases[] = { { 1 }, { 2 }, { 3 } };
 
-it("traps on the middle case", cases(trap_cases))
+it("traps on the middle case", cases(trap_case, trap_cases))
 {
     expect(it.v != 2, "case 2 is broken on purpose");
 }
 
 /* several failing expects in a single case are all reported under it */
-static const struct { int v; } multi_cases[] = { { 0 } };
+typedef struct { int v; } multi_case;
+static const multi_case multi_cases[] = { { 0 } };
 
-it("multiple failures in one case", cases(multi_cases))
+it("multiple failures in one case", cases(multi_case, multi_cases))
 {
     expect(it.v == 1, "first miss");
     expect(it.v == 2, "second miss");
 }
 
 /* .known is test-level: the case-[2] failure makes the aggregate known */
-static const struct { int x; } known_cases[] = { { 1 }, { 2 }, { 3 } };
+typedef struct { int x; } known_case;
+static const known_case known_cases[] = { { 1 }, { 2 }, { 3 } };
 
-it("known param bug", .known = "JIRA-99", cases(known_cases))
+it("known param bug", .known = "JIRA-99", cases(known_case, known_cases))
 {
     expect(it.x < 3, "value 3 not implemented");
 }
 
 /* .timeout wraps each case: case [2] spins and is aborted, the rest pass */
-static const struct { int spin; } slow_cases[] = { { 0 }, { 0 }, { 1 } };
+typedef struct { int spin; } slow_case;
+static const slow_case slow_cases[] = { { 0 }, { 0 }, { 1 } };
 
-it("per-case timeout", .timeout = 50, cases(slow_cases))
+it("per-case timeout", .timeout = 50, cases(slow_case, slow_cases))
 {
     while (it.spin) {}
 }
 
 /* .skip gates the whole aggregate */
-static const struct { int v; } skip_cases[] = { { 1 }, { 2 } };
+typedef struct { int v; } skip_case;
+static const skip_case skip_cases[] = { { 1 }, { 2 } };
 
-it("skipped param", .skip = 1, cases(skip_cases))
+it("skipped param", .skip = 1, cases(skip_case, skip_cases))
 {
     expect(it.v > 0, "never runs");
 }
 
 /* .platforms gates the whole aggregate */
-static const struct { int v; } plat_cases[] = { { 1 }, { 2 } };
+typedef struct { int v; } plat_case;
+static const plat_case plat_cases[] = { { 1 }, { 2 } };
 
-it("linux-only param", .platforms = "linux", cases(plat_cases))
+it("linux-only param", .platforms = "linux", cases(plat_case, plat_cases))
 {
     expect(it.v > 0, "runs on linux");
 }
 
 /* .std gates the whole aggregate (skipped: build is gnu99, not ISO C11) */
-static const struct { int v; } std_cases[] = { { 1 }, { 2 } };
+typedef struct { int v; } std_case;
+static const std_case std_cases[] = { { 1 }, { 2 } };
 
-it("c11 param", .std = "c11", cases(std_cases))
+it("c11 param", .std = "c11", cases(std_case, std_cases))
 {
     expect(it.v > 0, "never runs: only runs in an ISO C11 build");
 }
 
 /* signal expectations inside a parameterized body */
-static const struct { int should_abort; } sig_cases[] = { { 0 }, { 1 } };
+typedef struct { int should_abort; } sig_case;
+static const sig_case sig_cases[] = { { 0 }, { 1 } };
 
-it("abort per case", cases(sig_cases))
+it("abort per case", cases(sig_case, sig_cases))
 {
     if (it.should_abort)
-        ct_expect_abort({ abort(); });
+        expect_abort({ abort(); });
     else
         expect(1, "no abort expected");
 }
@@ -284,7 +288,7 @@ static const b_case boundary_cases[] = {
     { 56 }, { 57 }, { 58 }, { 59 }, { 60 }, { 61 }, { 62 }, { 63 },
 };
 
-it("boundary 64 cases", cases(boundary_cases))
+it("boundary 64 cases", cases(b_case, boundary_cases))
 {
     expect(it.n >= 0 && it.n <= 63, "in bounds");
 }
@@ -293,7 +297,7 @@ it("boundary 64 cases", cases(boundary_cases))
 static const int lc[] = { 1, 2 };
 
 it("this is an extremely long parameterized test name that overflows the "
-   "per-case name buffer used by the registry", cases(lc))
+   "per-case name buffer used by the registry", cases(int, lc))
 {
     expect(it == 1 || it == 2, "long-name cases");
 }

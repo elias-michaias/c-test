@@ -10,19 +10,30 @@
 
 #include "ctest.h"
 
-#include <dirent.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/prctl.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
 #include <time.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+#  include <windows.h>
+#  include <io.h>
+#  include <direct.h>
+#  ifdef _MSC_VER
+#    define strtok_r strtok_s
+#    define strdup   _strdup
+#  endif
+#else
+#  include <dirent.h>
+#  include <fcntl.h>
+#  include <poll.h>
+#  include <sys/prctl.h>
+#  include <sys/resource.h>
+#  include <sys/stat.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
 
 #define CT_MAX_BINS 32
 #define CT_MAX_FILTERS 8
@@ -52,16 +63,22 @@
 static int g_force_no_color;
 
 static void ct_setup_child(void) {
+#ifndef _WIN32
     struct rlimit rl = { 0, 0 };
     setrlimit(RLIMIT_CORE, &rl);
 #if defined(__linux__)
     prctl(PR_SET_DUMPABLE, 0);
 #endif
+#endif
 }
 
 static int ct_color(void) {
     static int v = -1;
+#ifdef _WIN32
+    if (v < 0) v = _isatty(_fileno(stdout));
+#else
     if (v < 0) v = isatty(fileno(stdout));
+#endif
     if (g_force_no_color) v = 0;
     return v;
 }
@@ -82,9 +99,16 @@ static const char *ct_g_skip(void) { return ct_color() ? CT_GLYPH_SKIP : "[SKIP]
 static const char *ct_g_known(void) { return ct_color() ? CT_GLYPH_KNOWN : "[KNOWN]"; }
 
 static double ct_now(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
 }
 
 static unsigned g_rng = 0x9e3779b9u;
@@ -244,8 +268,116 @@ static int ct_splittab(char *line, char **f, int maxf) {
 
 /*
  * Spawn a child, redirect its stdout and stderr into a pipe, read everything,
- * and return the raw wait status. Returns -1 if the process could not start.
+ * and return the exit code (or -1 on spawn failure). On POSIX returns raw wait
+ * status; on Windows returns the exit code directly. Use ct_exit_code() to
+ * normalise.
  */
+#ifdef _WIN32
+/* Build a Windows command line from an argv[] array, quoting as needed. */
+static int ct_cmdline(char *buf, size_t bufsz, char *const argv[]) {
+    size_t n = 0;
+    for (int i = 0; argv[i]; i++) {
+        const char *a = argv[i];
+        int q = (*a == '\0') || strchr(a, ' ') || strchr(a, '\t') || strchr(a, '"');
+        if (n && n + 1 < bufsz) buf[n++] = ' ';
+        if (q && n + 1 < bufsz) buf[n++] = '"';
+        for (; *a && n + 2 < bufsz; a++) {
+            if (*a == '"') buf[n++] = '\\';
+            buf[n++] = *a;
+        }
+        if (q && n + 1 < bufsz) buf[n++] = '"';
+    }
+    if (n >= bufsz) return -1;
+    buf[n] = '\0';
+    return 0;
+}
+
+static int ct_capture(const char *bin, char *const argv[], char **out) {
+    (void)bin;
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof sa);
+    sa.nLength = sizeof sa;
+    sa.bInheritHandle = TRUE;
+    HANDLE rh, wh;
+    if (!CreatePipe(&rh, &wh, &sa, 0)) { *out = calloc(1, 1); return -1; }
+    SetHandleInformation(rh, HANDLE_FLAG_INHERIT, 0);
+    char cmdline[8192];
+    if (ct_cmdline(cmdline, sizeof cmdline, argv) < 0) {
+        CloseHandle(rh); CloseHandle(wh);
+        *out = calloc(1, 1);
+        return -1;
+    }
+    STARTUPINFOA si;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = wh;
+    si.hStdError  = wh;
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof pi);
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    CloseHandle(wh);
+    if (!ok) {
+        CloseHandle(rh);
+        *out = calloc(1, 1);
+        return 127;
+    }
+    CloseHandle(pi.hThread);
+    size_t cap = 8192, n = 0;
+    char *buf = malloc(cap);
+    char tmp[4096];
+    DWORD nr;
+    while (ReadFile(rh, tmp, (DWORD)sizeof tmp, &nr, NULL) && nr > 0) {
+        if (n + (size_t)nr + 1 > cap) {
+            size_t nc = cap;
+            while (nc < n + (size_t)nr + 1) nc *= 2;
+            buf = realloc(buf, nc);
+            cap = nc;
+        }
+        memcpy(buf + n, tmp, (size_t)nr);
+        n += (size_t)nr;
+    }
+    CloseHandle(rh);
+    buf[n] = '\0';
+    *out = buf;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    return (int)code;
+}
+
+static HANDLE ct_spawn(const char *bin, const char *name, HANDLE *rh_out) {
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof sa);
+    sa.nLength = sizeof sa;
+    sa.bInheritHandle = TRUE;
+    HANDLE rh, wh;
+    if (!CreatePipe(&rh, &wh, &sa, 0)) return INVALID_HANDLE_VALUE;
+    SetHandleInformation(rh, HANDLE_FLAG_INHERIT, 0);
+    char cmdline[8192];
+    /* Simple quoting; test names don't normally contain '"'. */
+    snprintf(cmdline, sizeof cmdline, "\"%s\" --run \"%s\"", bin, name);
+    STARTUPINFOA si;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = wh;
+    si.hStdError  = wh;
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof pi);
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    CloseHandle(wh);
+    if (!ok) { CloseHandle(rh); return INVALID_HANDLE_VALUE; }
+    CloseHandle(pi.hThread);
+    *rh_out = rh;
+    return pi.hProcess;
+}
+
+#else  /* POSIX */
+
 static int ct_capture(const char *bin, char *const argv[], char **out) {
     int p[2];
     if (pipe(p) < 0) return -1;
@@ -288,6 +420,32 @@ static int ct_capture(const char *bin, char *const argv[], char **out) {
     return st;
 }
 
+static pid_t ct_spawn(const char *bin, const char *name, int *rfd) {
+    int p[2];
+    if (pipe(p) < 0) return -1;
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(p[0]);
+        close(p[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        close(p[0]);
+        dup2(p[1], 1);
+        dup2(p[1], 2);
+        close(p[1]);
+        ct_setup_child();
+        execl(bin, bin, "--run", name, (char *)NULL);
+        _exit(127);
+    }
+    close(p[1]);
+    *rfd = p[0];
+    return pid;
+}
+
+#endif /* _WIN32 */
+
 static void ct_bin_collect(const ct_opts *o, ct_bin *b) {
     char *argv[CT_ARGS_MAX];
     int n = 0;
@@ -306,7 +464,11 @@ static void ct_bin_collect(const ct_opts *o, ct_bin *b) {
 
     char *out = NULL;
     int st = ct_capture(b->path, argv, &out);
+#ifdef _WIN32
+    int code = st;  /* ct_capture returns exit code directly on Windows */
+#else
     int code = (st >= 0 && WIFEXITED(st)) ? WEXITSTATUS(st) : -1;
+#endif
     if (code == 127) {
         fprintf(stderr, "c-test: %s: cannot execute (not a ctest test binary?)\n",
                 b->path);
@@ -358,33 +520,7 @@ static void ct_bin_free(ct_bin *b) {
     b->cap = 0;
 }
 
-static pid_t ct_spawn(const char *bin, const char *name, int *rfd) {
-    int p[2];
-    if (pipe(p) < 0) return -1;
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        close(p[0]);
-        dup2(p[1], 1);
-        dup2(p[1], 2);
-        close(p[1]);
-        ct_setup_child();
-        execl(bin, bin, "--run", name, (char *)NULL);
-        _exit(127);
-    }
-    close(p[1]);
-    *rfd = p[0];
-    return pid;
-}
-
 typedef struct ct_slot {
-    pid_t pid;
-    int fd;
     int used;
     const ct_run *t;
     double started;
@@ -393,6 +529,13 @@ typedef struct ct_slot {
     size_t outcap;
     int retries;
     int flaky;
+#ifdef _WIN32
+    HANDLE proc;      /* process handle   */
+    HANDLE pipe_rh;   /* pipe read handle */
+#else
+    pid_t pid;
+    int fd;
+#endif
 } ct_slot;
 
 typedef struct ct_det {
@@ -410,6 +553,22 @@ typedef struct ct_det {
 } ct_det;
 
 static void ct_read_out(ct_slot *s) {
+#ifdef _WIN32
+    char tmp[4096];
+    DWORD nr;
+    while (ReadFile(s->pipe_rh, tmp, (DWORD)sizeof tmp, &nr, NULL) && nr > 0) {
+        if (s->outn + (size_t)nr + 1 > s->outcap) {
+            size_t nc = s->outcap ? s->outcap * 2 : 8192;
+            while (nc < s->outn + (size_t)nr + 1) nc *= 2;
+            s->out = realloc(s->out, nc);
+            s->outcap = nc;
+        }
+        memcpy(s->out + s->outn, tmp, (size_t)nr);
+        s->outn += (size_t)nr;
+    }
+    CloseHandle(s->pipe_rh);
+    s->pipe_rh = INVALID_HANDLE_VALUE;
+#else
     char tmp[4096];
     ssize_t r;
     while ((r = read(s->fd, tmp, sizeof tmp)) > 0) {
@@ -424,16 +583,32 @@ static void ct_read_out(ct_slot *s) {
     }
     close(s->fd);
     s->fd = -1;
+#endif
     if (s->out) s->out[s->outn] = '\0';
 }
 
 /*
- * Append whatever output the child has produced without blocking. A test may
- * emit protocol lines (`running\t<j>`) as it executes each parameterized
- * case, so POLLIN alone does not mean the child is done; we must keep its
- * pipe drained until POLLHUP (child exit) or the outer timeout fires.
+ * Drain available output from the child pipe without blocking. On POSIX uses
+ * O_NONBLOCK; on Windows uses PeekNamedPipe to check available bytes first.
  */
 static void ct_drain(ct_slot *s) {
+#ifdef _WIN32
+    DWORD avail;
+    char tmp[4096];
+    DWORD nr;
+    while (PeekNamedPipe(s->pipe_rh, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+        DWORD to_read = avail < (DWORD)sizeof tmp ? avail : (DWORD)sizeof tmp;
+        if (!ReadFile(s->pipe_rh, tmp, to_read, &nr, NULL) || nr == 0) break;
+        if (s->outn + (size_t)nr + 1 > s->outcap) {
+            size_t nc = s->outcap ? s->outcap * 2 : 8192;
+            while (nc < s->outn + (size_t)nr + 1) nc *= 2;
+            s->out = realloc(s->out, nc);
+            s->outcap = nc;
+        }
+        memcpy(s->out + s->outn, tmp, (size_t)nr);
+        s->outn += (size_t)nr;
+    }
+#else
     int fl = fcntl(s->fd, F_GETFL, 0);
     if (fl >= 0) {
         fcntl(s->fd, F_SETFL, fl | O_NONBLOCK);
@@ -451,6 +626,7 @@ static void ct_drain(ct_slot *s) {
         }
         fcntl(s->fd, F_SETFL, fl);
     }
+#endif
 }
 
 static int ct_parse_result(const char *buf, ct_det *d) {
@@ -569,6 +745,27 @@ static void ct_collect(ct_slot *s, const ct_run *t, double timeout_ms,
         ct_attr_last_running(s->out, &d->failures[0], &d->own_case_desc[0]);
         return;
     }
+#ifdef _WIN32
+    WaitForSingleObject(s->proc, INFINITE);
+    DWORD win_code = 0;
+    GetExitCodeProcess(s->proc, &win_code);
+    CloseHandle(s->proc);
+    s->proc = NULL;
+    /* Windows exception codes have the high bit set (0x80000000+). */
+    if (win_code >= 0x80000000U) {
+        d->status = CT_CRASH;
+        snprintf(d->detail, sizeof d->detail, "crashed (0x%08lX)",
+                 (unsigned long)win_code);
+        d->nfail = 1;
+        d->failures[0].file = t->file;
+        d->failures[0].line = t->line;
+        d->failures[0].expr = d->detail;
+        d->failures[0].case_index = -1;
+        ct_attr_last_running(s->out, &d->failures[0], &d->own_case_desc[0]);
+        return;
+    }
+    int code = (int)win_code;
+#else
     int st;
     waitpid(s->pid, &st, 0);
     s->pid = 0;
@@ -585,6 +782,7 @@ static void ct_collect(ct_slot *s, const ct_run *t, double timeout_ms,
         return;
     }
     int code = WIFEXITED(st) ? WEXITSTATUS(st) : 0;
+#endif
     if (ct_parse_result(s->out, d) == 0) {
         if (d->status == CT_FAIL && d->nfail == 0)
             ct_synth_fail(d, t, code);
@@ -605,6 +803,7 @@ static void ct_det_free(ct_det *d) {
     }
 }
 
+#ifndef _WIN32
 static int ct_poll_ready(const struct pollfd *fds, int nf, int fd) {
     for (int i = 0; i < nf; i++)
         if (fds[i].fd == fd)
@@ -618,6 +817,7 @@ static int ct_poll_hup(const struct pollfd *fds, int nf, int fd) {
             return (fds[i].revents & (POLLHUP | POLLERR)) != 0;
     return 0;
 }
+#endif /* !_WIN32 */
 
 static int g_name_width;
 static int g_total;
@@ -857,8 +1057,14 @@ static const ctest_reporter ct_tap = { ct_tap_begin, ct_tap_result, ct_tap_end }
 static const ctest_reporter ct_quiet = { ct_quiet_begin, ct_quiet_result, ct_quiet_end };
 
 static int ct_default_jobs(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int)si.dwNumberOfProcessors;
+#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;
+#endif
 }
 
 static char **g_rerun_set;
@@ -869,19 +1075,33 @@ static int g_failed_n;
 static void ct_mkdir_p(const char *path) {
     char *p = strdup(path);
     if (!p) return;
-    for (char *c = p; *c; c++) {
-        if (*c == '/') {
+    for (char *c = p + 1; *c; c++) {
+        if (*c == '/' || *c == '\\') {
             *c = '\0';
-            if (*p) mkdir(p, 0755);
+#ifdef _WIN32
+            CreateDirectoryA(p, NULL);
+#else
+            mkdir(p, 0755);
+#endif
             *c = '/';
         }
     }
-    if (*p) mkdir(p, 0755);
+#ifdef _WIN32
+    CreateDirectoryA(p, NULL);
+#else
+    mkdir(p, 0755);
+#endif
     free(p);
 }
 
 static const char *ct_state_path(void) {
     static char buf[4096];
+#ifdef _WIN32
+    const char *appdata = getenv("LOCALAPPDATA");
+    if (!appdata || !*appdata) appdata = getenv("APPDATA");
+    if (!appdata || !*appdata) appdata = ".";
+    snprintf(buf, sizeof buf, "%s\\c-test\\failed", appdata);
+#else
     const char *xdg = getenv("XDG_CACHE_HOME");
     const char *home = getenv("HOME");
     if (xdg && *xdg)
@@ -889,6 +1109,7 @@ static const char *ct_state_path(void) {
     else
         snprintf(buf, sizeof buf, "%s/.cache/c-test/failed",
                  home && *home ? home : ".");
+#endif
     return buf;
 }
 
@@ -1003,6 +1224,7 @@ static void ct_junit_close(void) {
     g_junit = NULL;
 }
 
+#ifndef _WIN32
 static void ct_gdb_backtrace(const ct_run *t) {
     char *argv[] = {
         (char *)"gdb", (char *)"-q", (char *)"-batch",
@@ -1027,20 +1249,29 @@ static void ct_gdb_backtrace(const ct_run *t) {
     }
     free(out);
 }
+#endif /* !_WIN32 */
 
 static int ct_slot_spawn(ct_slot *s, const ct_run *t, int retries) {
+#ifdef _WIN32
+    HANDLE rh;
+    HANDLE proc = ct_spawn(t->bin, t->name, &rh);
+    if (proc == INVALID_HANDLE_VALUE) return -1;
+    s->proc    = proc;
+    s->pipe_rh = rh;
+#else
     int fd;
     pid_t pid = ct_spawn(t->bin, t->name, &fd);
     if (pid < 0) return -1;
     s->pid = pid;
-    s->fd = fd;
-    s->t = t;
+    s->fd  = fd;
+#endif
+    s->t      = t;
     s->started = ct_now();
-    s->out = NULL;
-    s->outn = 0;
+    s->out    = NULL;
+    s->outn   = 0;
     s->outcap = 0;
     s->retries = retries;
-    s->used = 1;
+    s->used   = 1;
     return 0;
 }
 
@@ -1082,7 +1313,9 @@ static void ct_finalize(const ct_opts *o, ct_state *st, const ct_run *t,
     case CT_SKIP: st->skipped++; break;
     case CT_CRASH:
         st->crashed++;
+#ifndef _WIN32
         if (o->backtrace) ct_gdb_backtrace(t);
+#endif
         if (o->fail_fast) st->stop = 1;
         break;
     case CT_TIMEOUT: st->timedout++; if (o->fail_fast) st->stop = 1; break;
@@ -1124,7 +1357,9 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
     double t_start = ct_now();
 
     ct_slot *slots = calloc((size_t)jobs, sizeof *slots);
+#ifndef _WIN32
     struct pollfd *fds = malloc((size_t)jobs * sizeof *fds);
+#endif
     size_t next = 0;
 
     while (next < (size_t)n || !st.stop) {
@@ -1159,6 +1394,27 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
             if (!active) break;
         }
 
+#ifdef _WIN32
+        /* Build an array of process handles for WaitForMultipleObjects. */
+        HANDLE wprocs[MAXIMUM_WAIT_OBJECTS];
+        int    widx[MAXIMUM_WAIT_OBJECTS];
+        int nwp = 0;
+        for (int i = 0; i < jobs && nwp < MAXIMUM_WAIT_OBJECTS; i++)
+            if (slots[i].used) { wprocs[nwp] = slots[i].proc; widx[nwp++] = i; }
+        DWORD wto = INFINITE;
+        if (timeout > 0) {
+            double earliest = 0.0;
+            for (int i = 0; i < jobs; i++) {
+                if (!slots[i].used) continue;
+                double rem = timeout - (ct_now() - slots[i].started);
+                if (rem < 0) rem = 0;
+                if (earliest == 0.0 || rem < earliest) earliest = rem;
+            }
+            wto = (DWORD)(earliest * 1000.0 + 0.5);
+        }
+        if (nwp > 0) WaitForMultipleObjects((DWORD)nwp, wprocs, FALSE, wto);
+        (void)widx;
+#else
         int nf = 0;
         for (int i = 0; i < jobs; i++)
             if (slots[i].used) {
@@ -1179,12 +1435,26 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
             to = (int)(earliest * 1000.0);
         }
         if (nf > 0) poll(fds, (nfds_t)nf, to);
+#endif
 
         for (int i = 0; i < jobs; i++) {
             if (!slots[i].used) continue;
             const ct_run *t = slots[i].t;
             ct_det d;
             int is_to = 0;
+#ifdef _WIN32
+            if (timeout > 0 && ct_now() - slots[i].started >= timeout) {
+                TerminateProcess(slots[i].proc, 1);
+                is_to = 1;
+            } else {
+                DWORD wcode;
+                if (!GetExitCodeProcess(slots[i].proc, &wcode) ||
+                    wcode == STILL_ACTIVE) {
+                    ct_drain(&slots[i]);
+                    continue;
+                }
+            }
+#else
             if (timeout > 0 && ct_now() - slots[i].started >= timeout) {
                 kill(slots[i].pid, SIGKILL);
                 is_to = 1;
@@ -1192,6 +1462,7 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
                 if (ct_poll_ready(fds, nf, slots[i].fd)) ct_drain(&slots[i]);
                 continue;
             }
+#endif
             ct_collect(&slots[i], t, (double)o->timeout_ms, is_to, &d);
 
             int bad = (d.status == CT_FAIL && !d.known) ||
@@ -1228,14 +1499,24 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
 
     for (int i = 0; i < jobs; i++) {
         if (!slots[i].used) continue;
+#ifdef _WIN32
+        TerminateProcess(slots[i].proc, 1);
+        WaitForSingleObject(slots[i].proc, 5000);
+        CloseHandle(slots[i].proc);
+        { char drain[64]; DWORD nr;
+          while (ReadFile(slots[i].pipe_rh, drain, sizeof drain, &nr, NULL) && nr > 0) {} }
+        CloseHandle(slots[i].pipe_rh);
+#else
         kill(slots[i].pid, SIGKILL);
         waitpid(slots[i].pid, NULL, 0);
-        char drain[64];
-        while (read(slots[i].fd, drain, sizeof drain) > 0) {}
+        { char drain[64]; while (read(slots[i].fd, drain, sizeof drain) > 0) {} }
         close(slots[i].fd);
+#endif
         free(slots[i].out);
     }
+#ifndef _WIN32
     free(fds);
+#endif
     free(slots);
 
     double t_end = ct_now();
@@ -1264,6 +1545,41 @@ static int g_capwf;
 static time_t *g_bin_mtimes;
 
 static void ct_wscan(ct_wfile **out, int *n, int *cap, const char *dir) {
+#ifdef _WIN32
+    char pattern[4096];
+    snprintf(pattern, sizeof pattern, "%s\\*",
+             strcmp(dir, ".") == 0 ? "." : dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        char path[4096];
+        if (strcmp(dir, ".") == 0)
+            snprintf(path, sizeof path, "%s", fd.cFileName);
+        else
+            snprintf(path, sizeof path, "%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ct_wscan(out, n, cap, path);
+        } else {
+            const char *dot = strrchr(fd.cFileName, '.');
+            if (dot && (!strcmp(dot, ".c") || !strcmp(dot, ".h"))) {
+                if (*n == *cap) {
+                    *cap = *cap ? *cap * 2 : 64;
+                    *out = realloc(*out, (size_t)*cap * sizeof **out);
+                }
+                ULARGE_INTEGER mt;
+                mt.LowPart  = fd.ftLastWriteTime.dwLowDateTime;
+                mt.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+                (*out)[*n].path  = strdup(path);
+                (*out)[*n].mtime = (time_t)(mt.QuadPart / 10000000ULL
+                                            - 11644473600ULL);
+                (*n)++;
+            }
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
@@ -1290,6 +1606,7 @@ static void ct_wscan(ct_wfile **out, int *n, int *cap, const char *dir) {
         }
     }
     closedir(d);
+#endif
 }
 
 static int ct_watch_poll(const ct_opts *o) {
@@ -1298,8 +1615,19 @@ static int ct_watch_poll(const ct_opts *o) {
     ct_wscan(&nw, &nn, &cap, ".");
     int changed = (nn != g_nwf);
     for (int b = 0; b < o->nbins && !changed; b++) {
+#ifdef _WIN32
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        time_t m = 0;
+        if (GetFileAttributesExA(o->bins[b], GetFileExInfoStandard, &fad)) {
+            ULARGE_INTEGER mt;
+            mt.LowPart  = fad.ftLastWriteTime.dwLowDateTime;
+            mt.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+            m = (time_t)(mt.QuadPart / 10000000ULL - 11644473600ULL);
+        }
+#else
         struct stat st;
         time_t m = stat(o->bins[b], &st) == 0 ? st.st_mtime : 0;
+#endif
         if (m != g_bin_mtimes[b]) changed = 1;
     }
     if (!changed) {
@@ -1320,8 +1648,20 @@ static int ct_watch_poll(const ct_opts *o) {
     g_nwf = nn;
     g_capwf = cap;
     for (int b = 0; b < o->nbins; b++) {
+#ifdef _WIN32
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        time_t m = 0;
+        if (GetFileAttributesExA(o->bins[b], GetFileExInfoStandard, &fad)) {
+            ULARGE_INTEGER mt;
+            mt.LowPart  = fad.ftLastWriteTime.dwLowDateTime;
+            mt.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+            m = (time_t)(mt.QuadPart / 10000000ULL - 11644473600ULL);
+        }
+        g_bin_mtimes[b] = m;
+#else
         struct stat st;
         g_bin_mtimes[b] = stat(o->bins[b], &st) == 0 ? st.st_mtime : 0;
+#endif
     }
     return changed;
 }
@@ -1547,8 +1887,12 @@ int main(int argc, char **argv) {
                    ct_ansi(CT_DIM), ct_ansi(CT_RESET));
             fflush(stdout);
             while (!ct_watch_poll(&o)) {
+#ifdef _WIN32
+                Sleep(200);
+#else
                 struct timespec ts = { 0, 200000000L };
                 nanosleep(&ts, NULL);
+#endif
             }
             if (ct_color()) printf("\033[2J\033[H");
             fflush(NULL);

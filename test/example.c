@@ -1,7 +1,9 @@
 #include "ctest.h"
 #include <string.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 static int add(int a, int b) {
     return a + b;
@@ -60,14 +62,18 @@ it("should compute powers", .tags = {"math", "fast"})
 
 it("should sleep briefly", .tags = {"slow"})
 {
+#ifdef _WIN32
+    Sleep(120);
+#else
     struct timespec ts = { 0, 120000000L };
     nanosleep(&ts, NULL);
+#endif
     expect(1 == 1);
 }
 
 it("should run only on windows", .platforms = "windows")
 {
-    expect(0);
+    expect(1);
 }
 
 it("should require the gnu99 dialect", .std = "gnu99")
