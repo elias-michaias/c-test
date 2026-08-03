@@ -166,6 +166,7 @@ typedef struct ct_btest {
     char *name;
     char *file;
     int line;
+    int timeout_ms;
 } ct_btest;
 
 typedef struct ct_bin {
@@ -180,6 +181,7 @@ typedef struct ct_run {
     const char *name;
     const char *file;
     int line;
+    int timeout_ms;  /* per-test timeout from --list (0 = none) */
 } ct_run;
 
 static void ct_usage(FILE *out) {
@@ -490,9 +492,11 @@ static void ct_bin_collect(const ct_opts *o, ct_bin *b) {
     for (char *line = strtok_r(out, "\n", &save); line;
          line = strtok_r(NULL, "\n", &save)) {
         if (!*line) continue;
-        char *f[3];
-        if (ct_splittab(line, f, 3) < 3) continue;
+        char *f[4];
+        int nf = ct_splittab(line, f, 4);
+        if (nf < 3) continue;
         int line_no = atoi(f[2]);
+        int tms = nf >= 4 ? atoi(f[3]) : 0;
         if (b->n == b->cap) {
             b->cap = b->cap ? b->cap * 2 : 16;
             b->tests = realloc(b->tests, (size_t)b->cap * sizeof *b->tests);
@@ -500,6 +504,7 @@ static void ct_bin_collect(const ct_opts *o, ct_bin *b) {
         b->tests[b->n].name = strdup(f[0]);
         b->tests[b->n].file = strdup(f[1]);
         b->tests[b->n].line = line_no;
+        b->tests[b->n].timeout_ms = tms;
         b->n++;
     }
     free(out);
@@ -732,8 +737,8 @@ static void ct_attr_last_running(const char *out, ctest_failure *f,
 static void ct_collect(ct_slot *s, const ct_run *t, double timeout_ms,
                        int is_timeout, ct_det *d) {
     memset(d, 0, sizeof *d);
-    ct_read_out(s);
     if (is_timeout) {
+        ct_read_out(s);
         d->status = CT_TIMEOUT;
         snprintf(d->detail, sizeof d->detail, "timed out after %d ms",
                  (int)timeout_ms);
@@ -746,11 +751,16 @@ static void ct_collect(ct_slot *s, const ct_run *t, double timeout_ms,
         return;
     }
 #ifdef _WIN32
+    /* Wait for full process termination before reading the pipe.
+       On Wine, GetExitCodeProcess may return before the write-end of the
+       pipe is closed, so ReadFile inside ct_read_out would block forever
+       if we don't guarantee the process is fully dead first. */
     WaitForSingleObject(s->proc, INFINITE);
     DWORD win_code = 0;
     GetExitCodeProcess(s->proc, &win_code);
     CloseHandle(s->proc);
     s->proc = NULL;
+    ct_read_out(s);
     /* Windows exception codes have the high bit set (0x80000000+). */
     if (win_code >= 0x80000000U) {
         d->status = CT_CRASH;
@@ -766,6 +776,7 @@ static void ct_collect(ct_slot *s, const ct_run *t, double timeout_ms,
     }
     int code = (int)win_code;
 #else
+    ct_read_out(s);
     int st;
     waitpid(s->pid, &st, 0);
     s->pid = 0;
@@ -972,6 +983,7 @@ static void ct_pretty_end(const ctest_summary *s) {
             printf("    %s%s %s%5.0f ms  %s\n", d, ct_glyph(CT_GLYPH_CLOCK), rs,
                    s->slow[i].seconds * 1000.0, s->slow[i].name);
     }
+    fflush(stdout);
 }
 
 static void ct_quiet_begin(int total) {
@@ -1401,16 +1413,20 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
         int nwp = 0;
         for (int i = 0; i < jobs && nwp < MAXIMUM_WAIT_OBJECTS; i++)
             if (slots[i].used) { wprocs[nwp] = slots[i].proc; widx[nwp++] = i; }
-        DWORD wto = INFINITE;
-        if (timeout > 0) {
-            double earliest = 0.0;
-            for (int i = 0; i < jobs; i++) {
-                if (!slots[i].used) continue;
-                double rem = timeout - (ct_now() - slots[i].started);
+        /* Cap wait at 50 ms so pipes are drained regularly — otherwise a
+           child that fills the pipe buffer will deadlock with a parent
+           blocked in WaitForMultipleObjects. Also account for per-test timeouts. */
+        DWORD wto = 50;
+        for (int i = 0; i < jobs; i++) {
+            if (!slots[i].used) continue;
+            double slot_to = slots[i].t->timeout_ms > 0
+                ? (double)slots[i].t->timeout_ms / 1000.0 : timeout;
+            if (slot_to > 0) {
+                double rem = slot_to - (ct_now() - slots[i].started);
                 if (rem < 0) rem = 0;
-                if (earliest == 0.0 || rem < earliest) earliest = rem;
+                DWORD to_ms = (DWORD)(rem * 1000.0 + 0.5);
+                if (to_ms < wto) wto = to_ms;
             }
-            wto = (DWORD)(earliest * 1000.0 + 0.5);
         }
         if (nwp > 0) WaitForMultipleObjects((DWORD)nwp, wprocs, FALSE, wto);
         (void)widx;
@@ -1424,15 +1440,19 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
                 nf++;
             }
         int to = -1;
-        if (timeout > 0) {
+        {
             double earliest = 0.0;
-            for (int i = 0; i < jobs; i++)
-                if (slots[i].used) {
-                    double rem = timeout - (ct_now() - slots[i].started);
+            for (int i = 0; i < jobs; i++) {
+                if (!slots[i].used) continue;
+                double slot_to = slots[i].t->timeout_ms > 0
+                    ? (double)slots[i].t->timeout_ms / 1000.0 : timeout;
+                if (slot_to > 0) {
+                    double rem = slot_to - (ct_now() - slots[i].started);
                     if (rem < 0) rem = 0;
                     if (earliest == 0.0 || rem < earliest) earliest = rem;
                 }
-            to = (int)(earliest * 1000.0);
+            }
+            if (earliest > 0.0) to = (int)(earliest * 1000.0);
         }
         if (nf > 0) poll(fds, (nfds_t)nf, to);
 #endif
@@ -1440,10 +1460,14 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
         for (int i = 0; i < jobs; i++) {
             if (!slots[i].used) continue;
             const ct_run *t = slots[i].t;
+            /* Per-test timeout overrides the global one; 0 means no limit. */
+            double slot_timeout = t->timeout_ms > 0
+                ? (double)t->timeout_ms / 1000.0
+                : timeout;
             ct_det d;
             int is_to = 0;
 #ifdef _WIN32
-            if (timeout > 0 && ct_now() - slots[i].started >= timeout) {
+            if (slot_timeout > 0 && ct_now() - slots[i].started >= slot_timeout) {
                 TerminateProcess(slots[i].proc, 1);
                 is_to = 1;
             } else {
@@ -1455,7 +1479,7 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
                 }
             }
 #else
-            if (timeout > 0 && ct_now() - slots[i].started >= timeout) {
+            if (slot_timeout > 0 && ct_now() - slots[i].started >= slot_timeout) {
                 kill(slots[i].pid, SIGKILL);
                 is_to = 1;
             } else if (!ct_poll_hup(fds, nf, slots[i].fd)) {
@@ -1463,7 +1487,8 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
                 continue;
             }
 #endif
-            ct_collect(&slots[i], t, (double)o->timeout_ms, is_to, &d);
+            int eff_timeout_ms = t->timeout_ms > 0 ? t->timeout_ms : o->timeout_ms;
+            ct_collect(&slots[i], t, (double)eff_timeout_ms, is_to, &d);
 
             int bad = (d.status == CT_FAIL && !d.known) ||
                       d.status == CT_CRASH ||
@@ -1740,6 +1765,7 @@ static int ct_collect_all(const ct_opts *o, ct_bin *bins, ct_run **runs_out,
             runs[n].name = bins[b].tests[i].name;
             runs[n].file = bins[b].tests[i].file;
             runs[n].line = bins[b].tests[i].line;
+            runs[n].timeout_ms = bins[b].tests[i].timeout_ms;
             n++;
         }
     }
@@ -1758,6 +1784,9 @@ static void ct_shuffle_runs(ct_run *arr, size_t n) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    SetConsoleOutputCP(65001);  /* UTF-8 output */
+#endif
     ct_opts o;
     memset(&o, 0, sizeof o);
     o.seed = (unsigned)time(NULL);

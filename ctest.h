@@ -1192,7 +1192,7 @@ static int ct_list(const ct_opts *o) {
     ct_build_sel(o, &sel, &nsel);
     for (size_t i = 0; i < nsel; i++) {
         const ctest_test *t = g_tests[sel[i]];
-        printf("%s\t%s\t%d\n", t->spec.name, t->file, t->line);
+        printf("%s\t%s\t%d\t%d\n", t->spec.name, t->file, t->line, t->spec.timeout);
     }
     free(sel);
     return 0;
