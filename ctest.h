@@ -441,10 +441,16 @@ static void CT_UNUSED ct_noop_after_each(void) {}
 #endif
 
 /*
- * CT_REGISTER places the ctest_test record into the section. On ELF/Mach-O the
- * struct itself lives in the section (walked by pointer arithmetic). On MSVC PE
- * the struct lives in normal BSS/data and a *pointer* to it is placed in the
- * "ct_tst$b" sub-section; the walker dereferences each pointer.
+ * CT_REGISTER places the ctest_test record into the section. On all platforms
+ * the struct itself lives in normal static storage and a *pointer* to it is
+ * placed in the section. The walker dereferences each pointer.
+ *
+ * This avoids struct-alignment issues: the section stride is always
+ * sizeof(pointer), regardless of how large or oddly-padded ctest_test is.
+ *
+ * MSVC PE: sub-section alpha-sort trick. NULL sentinels in $a/$z.
+ * ELF:     __start_ct_tst / __stop_ct_tst sentinels from GNU ld.
+ * Mach-O:  section$start / section$end from ld64.
  */
 #ifdef CT_SECTION_MSVC
 #define CT_REGISTER(...)                                                     \
@@ -459,14 +465,16 @@ static void CT_UNUSED ct_noop_after_each(void) {}
         CT_NAME(ct_ptr) = &CT_NAME(ct_rec);
 #else
 #define CT_REGISTER(...)                                                     \
-    static const struct ctest_test CT_NAME(ct_rec)                           \
-        __attribute__((used, section(CT_SECTION_NAME))) = {                  \
+    static const struct ctest_test CT_NAME(ct_rec) = {                      \
         CT_SPEC_VALUE(__VA_ARGS__),                                          \
         __FILE__, __LINE__,                                                  \
         CT_NAME(ct_run),                                                     \
         CT_PARAM_DATA(__VA_ARGS__), CT_PARAM_ELEM(__VA_ARGS__),              \
         CT_PARAM_COUNT(__VA_ARGS__)                                          \
-    };
+    };                                                                       \
+    __attribute__((used, section(CT_SECTION_NAME)))                          \
+    static const struct ctest_test * const CT_NAME(ct_ptr) =                 \
+        &CT_NAME(ct_rec);
 #endif
 
 #define it(...) CT_DIAG_PUSH                                                 \
@@ -496,19 +504,19 @@ typedef struct ctest_test {
  * needs these to walk [CT_SEC_START, CT_SEC_STOP).
  */
 #if defined(__APPLE__)
-extern const struct ctest_test section$start$__DATA$ct_tst;
-extern const struct ctest_test section$end$__DATA$ct_tst;
-#define CT_SEC_START ((const struct ctest_test *)&section$start$__DATA$ct_tst)
-#define CT_SEC_STOP  ((const struct ctest_test *)&section$end$__DATA$ct_tst)
+extern const struct ctest_test *section$start$__DATA$ct_tst;
+extern const struct ctest_test *section$end$__DATA$ct_tst;
+#define CT_SEC_PTR_START (&section$start$__DATA$ct_tst)
+#define CT_SEC_PTR_STOP  (&section$end$__DATA$ct_tst)
 #elif defined(CT_SECTION_MSVC)
 /* Sentinel pointers at sub-section boundaries; the walker reads [start+1, stop). */
 __declspec(allocate("ct_tst$a")) static const struct ctest_test *ct_msvc_sec_start = NULL;
 __declspec(allocate("ct_tst$z")) static const struct ctest_test *ct_msvc_sec_stop  = NULL;
 #elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__))
-extern const struct ctest_test __start_ct_tst[];
-extern const struct ctest_test __stop_ct_tst[];
-#define CT_SEC_START ((const struct ctest_test *)__start_ct_tst)
-#define CT_SEC_STOP  ((const struct ctest_test *)__stop_ct_tst)
+extern const struct ctest_test * const __start_ct_tst[];
+extern const struct ctest_test * const __stop_ct_tst[];
+#define CT_SEC_PTR_START (__start_ct_tst)
+#define CT_SEC_PTR_STOP  (__stop_ct_tst)
 #endif
 
 static const struct ctest_test **g_tests;
@@ -1543,12 +1551,20 @@ int ctest_run(int argc, char **argv) {
     }
 #else
     {
-        size_t n = (size_t)(CT_SEC_STOP - CT_SEC_START);
-        if (n) {
-            g_tests = (const struct ctest_test **)malloc(n * sizeof(*g_tests));
-            if (!g_tests) { fprintf(stderr, "ctest: out of memory\n"); return 2; }
-            for (size_t i = 0; i < n; i++) g_tests[i] = &CT_SEC_START[i];
-            g_count = n;
+        const struct ctest_test * const *pp = CT_SEC_PTR_START;
+        const struct ctest_test * const *pe = CT_SEC_PTR_STOP;
+        size_t cap = (size_t)(pe - pp) + 1;
+        g_tests = (const struct ctest_test **)malloc(cap * sizeof *g_tests);
+        if (!g_tests) { fprintf(stderr, "ctest: out of memory\n"); return 2; }
+        for (; pp < pe; pp++) {
+            if (!*pp) continue;
+            if (g_count >= cap) {
+                cap *= 2;
+                g_tests = (const struct ctest_test **)realloc(
+                    g_tests, cap * sizeof *g_tests);
+                if (!g_tests) { fprintf(stderr, "ctest: out of memory\n"); return 2; }
+            }
+            g_tests[g_count++] = *pp;
         }
     }
 #endif
