@@ -2,17 +2,24 @@
 #define CTEST_H
 
 /*
- * ctest is a single-header test framework written to strict ISO C99 for GCC,
- * Clang, and TCC. It compiles cleanly under `-std=c99 -Wall -Wextra -pedantic
- * -Werror`. The only pragmatism is `__typeof__` (a reserved double-underscore
- * name strict C99 accepts silently) used to derive the parameterized-test case
- * type, plus `_Pragma` diagnostic push/pop on GCC and Clang. No constructors
- * and no weak symbols are used, so every feature behaves identically on TCC.
+ * ctest is a single-header test framework for GCC, Clang, and MSVC. It uses
+ * one non-standard feature deliberately: `__attribute__((section(...)))` (or
+ * the MSVC `__pragma(allocate(...))` equivalent) for open-world test
+ * registration, in the same spirit as Criterion and other modern C/C++
+ * runners. No ISO C99 fallback is provided; the design target is "the big
+ * three", not strict portability.
  *
- * Tests register explicitly: `it(id, "name", ...)` emits a file-scope record,
- * and each test file lists its records in a `ctest_suite` array. The header's
- * `main()` passes that suite to ctest_run(), which provides the --list / --run
- * protocol for the `c-test` CLI launcher plus a standalone in-process mode.
+ * Open-world registration: `it("name", ...) { body }` emits a self-describing
+ * `static const struct ctest_test` record into a custom linker section
+ * (`ct_tst`). The runner enumerates the section at startup via linker-provided
+ * sentinels (`__start_ct_tst` / `__stop_ct_tst` on GNU ELF, the
+ * `section$start$` / `section$end$` asm labels on Mach-O). There is no
+ * registration call, no per-file suite array, and no ID to invent -- tests
+ * live next to business logic and are found automatically.
+ *
+ * Each `it()` runs in its own child process under the `c-test` CLI launcher
+ * (fork/exec per test) so crashes and timeouts are isolated and reported. A
+ * standalone in-process `--run-all` mode is also available.
  *
  * Lifecycle hooks (ctest_setup, ctest_teardown, ctest_before_each,
  * ctest_after_each) default to no-ops. Override one by `#define`-mapping it to
@@ -21,15 +28,9 @@
  * The runner needs POSIX APIs (timers, signals), so the feature test level is
  * set below. Define a compatible `_POSIX_C_SOURCE` (or `_GNU_SOURCE`) of your
  * own before including this header to opt out.
- *
- * TCC 0.9.27 notes (spurious, tcc bugs on valid C99): it cannot compile glibc's
- * <regex.h>, so --match is substring-based and the header never includes it;
- * and it warns "assignment of read-only location" when a parameterized test's
- * case table is a large `const` struct (a by-value copy artifact). Both build
- * cleanly under GCC and Clang.
  */
-#if !(defined(__GNUC__) || defined(__clang__) || defined(__TINYC__))
-#error "ctest requires GCC, Clang, or TCC"
+#if !(defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
+#error "ctest requires GCC, Clang, or MSVC"
 #endif
 
 #ifndef _POSIX_C_SOURCE
@@ -213,15 +214,35 @@ typedef struct ctest_reporter {
 
 struct ctest_test;
 
-int ctest_run(int argc, char **argv, const struct ctest_test *const *suite);
-
-extern const struct ctest_test *const ctest_suite[];
+int ctest_run(int argc, char **argv);
 
 int main(int argc, char **argv) {
-    return ctest_run(argc, argv, ctest_suite);
+    return ctest_run(argc, argv);
 }
 
 #define main ctest_app_main
+
+/*
+ * Open-world section: each `it()` drops a `struct ctest_test` into the
+ * `ct_tst` linker section. The runner walks `[CT_SEC_START, CT_SEC_STOP)` at
+ * startup. GNU ld and ld64 each provide a sentinel for section bounds:
+ *
+ *   - GNU ELF: `__start_<section>` / `__stop_<section>` are materialized by
+ *     the linker for any section whose name is a valid C identifier, as long
+ *     as the symbols are referenced. We reference both, so the section is
+ *     retained even under `--gc-sections`.
+ *   - Mach-O: equivalent `section$start$__DATA$<section>` /
+ *     `section$end$__DATA$<section>` asm-derived labels.
+ *
+ * MSVC PE has no equivalent sentinel and needs its own walker; pending.
+ */
+#if defined(__APPLE__)
+#define CT_SECTION_NAME "__DATA,ct_tst"
+#elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__))
+#define CT_SECTION_NAME "ct_tst"
+#else
+#error "ctest open-world registration needs GNU ELF (gcc/clang) or Mach-O. MSVC PE support is pending."
+#endif
 
 #define CT_MAX_FILTERS 8
 #define CT_TAGQ_MAX 16
@@ -295,30 +316,29 @@ static void CT_UNUSED ct_noop_after_each(void) {}
 #endif
 
 /*
- * Tests register by listing their records in a `ctest_suite` array, one per
- * test file, e.g.:
+ * Registration is open-world: drop `it("name", ...) { body }` anywhere at file
+ * scope. There is no per-file suite array, no ID, and no central list to
+ * maintain -- the record is placed in the `ct_tst` linker section and found by
+ * the runner at startup.
  *
- *     const struct ctest_test *const ctest_suite[] = {
- *         CT_IT(t_multiply),
- *         CT_IT(t_plain),
- *         0
- *     };
+ * Plain tests take no signature; `it` emits `(void)` automatically:
+ *
+ *     it("does something") { ... }
  *
  * `cases(array)` is passed as the last `it` argument. `it` derives the case
  * type from the array's element type and declares a by-value `it` struct for
  * the body:
  *
  *     static const struct { int a, b; } mult_cases[] = { {2, 3}, {3, 4} };
- *     it(t_multiply, "multiply", cases(mult_cases)) {
+ *     it("multiply", cases(mult_cases)) {
  *         expect(it.a * it.b == 6, "multiplication");
  *     }
  *
- * Plain tests take no signature; `it` emits `(void)` automatically:
- *
- *     it(t_plain, "does something") { ... }
- *
  * `cases` may be combined with the other `it` options and must be the last
- * argument: it(t_x, "name", .tags = {"math"}, cases(array)).
+ * argument: it("name", .tags = {"math"}, cases(array)).
+ *
+ * Each `it` expands on a single source line, so two `it()`s on the same line
+ * collide. Keep one per line -- the natural style anyway.
  */
 #define CT_SPEC_VALUE_0(...) { __VA_ARGS__ }
 #define CT_SPEC_VALUE_1(...) { CT_DROP_LAST(__VA_ARGS__) }
@@ -340,8 +360,6 @@ static void CT_UNUSED ct_noop_after_each(void) {}
 #define CT_PARAM_COUNT(...) CT_PARAM_COUNT_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_PARAM_COUNT_II(c, ...) CT_CAT(CT_PARAM_COUNT_, c)(__VA_ARGS__)
 
-#define CT_IT(id) (&id##_rec)
-
 /*
  * The `it` macro relies on a prototype-less forward declaration and on
  * partial struct initializers, which trip clang-only warnings
@@ -362,22 +380,22 @@ static void CT_UNUSED ct_noop_after_each(void) {}
     _Pragma("GCC diagnostic ignored \"-Wmissing-field-initializers\"")
 #define CT_DIAG_POP _Pragma("GCC diagnostic pop")
 #else
-/* TCC (and other compilers without the _Pragma operator): no diagnostics. */
 #define CT_DIAG_PUSH
 #define CT_DIAG_POP
 #endif
 
-#define it(id, ...) CT_DIAG_PUSH                                             \
+#define it(...) CT_DIAG_PUSH                                                 \
     CT_PARAM_TYPEDEF(__VA_ARGS__)                                            \
     static void CT_NAME(ctest_fn)();                                         \
-    static void id##_run(void) {                                             \
-        CT_PARAM_CALL(__VA_ARGS__)                                           \
+    static void CT_NAME(ct_run)(void) {                                      \
+        CT_PARAM_CALL(__VA_ARGS__)                                          \
     }                                                                        \
-    static const struct ctest_test id##_rec = {                              \
+    static const struct ctest_test CT_NAME(ct_rec)                            \
+        __attribute__((used, section(CT_SECTION_NAME))) = {                  \
         CT_SPEC_VALUE(__VA_ARGS__),                                          \
         __FILE__, __LINE__,                                                  \
-        id##_run,                                                            \
-        CT_PARAM_DATA(__VA_ARGS__), CT_PARAM_ELEM(__VA_ARGS__),              \
+        CT_NAME(ct_run),                                                     \
+        CT_PARAM_DATA(__VA_ARGS__), CT_PARAM_ELEM(__VA_ARGS__),               \
         CT_PARAM_COUNT(__VA_ARGS__)                                          \
     };                                                                       \
     CT_DIAG_POP                                                              \
@@ -393,7 +411,25 @@ typedef struct ctest_test {
     size_t cases_count;
 } ctest_test;
 
-static const struct ctest_test *const *g_tests;
+/*
+ * Linker-provided section sentinels. Declared here (after `struct ctest_test`
+ * is complete) so the array-of-record externs have a complete element type.
+ * `it()` only needs `CT_SECTION_NAME` (a string, defined above); the runner
+ * needs these to walk [CT_SEC_START, CT_SEC_STOP).
+ */
+#if defined(__APPLE__)
+extern const struct ctest_test section$start$__DATA$ct_tst;
+extern const struct ctest_test section$end$__DATA$ct_tst;
+#define CT_SEC_START ((const struct ctest_test *)&section$start$__DATA$ct_tst)
+#define CT_SEC_STOP  ((const struct ctest_test *)&section$end$__DATA$ct_tst)
+#elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__))
+extern const struct ctest_test __start_ct_tst[];
+extern const struct ctest_test __stop_ct_tst[];
+#define CT_SEC_START ((const struct ctest_test *)__start_ct_tst)
+#define CT_SEC_STOP  ((const struct ctest_test *)__stop_ct_tst)
+#endif
+
+static const struct ctest_test **g_tests;
 static size_t g_count;
 static const void *g_case_ptr;
 
@@ -1350,13 +1386,21 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel,
     return failed > 0 ? 1 : 0;
 }
 
-int ctest_run(int argc, char **argv, const struct ctest_test *const *suite) {
+int ctest_run(int argc, char **argv) {
 #if defined(__linux__)
     prctl(PR_SET_DUMPABLE, 0);
 #endif
-    g_tests = suite;
+    g_tests = NULL;
     g_count = 0;
-    while (suite[g_count]) g_count++;
+    {
+        size_t n = (size_t)(CT_SEC_STOP - CT_SEC_START);
+        if (n) {
+            g_tests = (const struct ctest_test **)malloc(n * sizeof(*g_tests));
+            if (!g_tests) { fprintf(stderr, "ctest: out of memory\n"); return 2; }
+            for (size_t i = 0; i < n; i++) g_tests[i] = &CT_SEC_START[i];
+            g_count = n;
+        }
+    }
     ct_opts o;
     memset(&o, 0, sizeof o);
     o.reporter = &ct_pretty;
@@ -1439,12 +1483,12 @@ int ctest_run(int argc, char **argv, const struct ctest_test *const *suite) {
 
 #include <signal.h>
 
-/*
- * Minimal non-test mode for app binaries built without -DCTEST (e.g. the
+/* Minimal non-test mode for app binaries built without -DCTEST (e.g. the
  * same source compiled as a plain application). Every test macro becomes a
- * no-op, but each still *references* its arguments so parameterized test
- * signatures do not produce -Wunused-parameter warnings when the header is
- * parsed by an editor or IDE without the -DCTEST define.
+ * no-op: `it("name") { body }` expands to an unreferenced static function
+ * (stripped by `-ffunction-sections -Wl,--gc-sections`), and assertions
+ * devolve to `(void)((0 && (expr)))` so the bodies still type-check without
+ * referencing the framework.
  */
 #define it(...) CT_PARAM_TYPEDEF(__VA_ARGS__)                                \
     CT_PARAM_USE(__VA_ARGS__)                                                \
@@ -1455,10 +1499,6 @@ int ctest_run(int argc, char **argv, const struct ctest_test *const *suite) {
 #define expect(...) CT_NCT_SELECT(__VA_ARGS__, CT_NOP_2, CT_NOP_1, 0)(__VA_ARGS__)
 #define ct_expect_signal(sig, ...) ((void)(0 && (sig)))
 #define ct_expect_abort(...) ct_expect_signal(SIGABRT, __VA_ARGS__)
-
-/* The suite array is written once per file and must compile here too. */
-struct ctest_test { char ct_unused; };
-#define CT_IT(id) 0
 
 #endif
 

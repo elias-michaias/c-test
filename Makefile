@@ -1,13 +1,15 @@
-# ISO C99 by default. Any C99-capable compiler works; override the standard
-# with `make STD=gnu99` if you want GNU extensions.
+# GNU C99 (with extensions) by default: open-world registration uses
+# `__attribute__((section))` for self-registering tests. gcc and clang work
+# on Linux/macOS; MSVC needs the PE section walker (pending). Override the
+# standard with `make STD=c11` etc, but stay on a GNU dialect.
 CC      ?= cc
-STD     ?= c99
-CFLAGS  ?= -std=$(STD) -Wall -Wextra -pedantic -g
+STD     ?= gnu99
+CFLAGS  ?= -std=$(STD) -Wall -Wextra -g
 CFLAGS  += -Wno-missing-field-initializers
 
 .PHONY: all strict run tap list filter sizes clean
 
-all: c-test example app app-notest libtest
+all: c-test example app app-notest libtest crash
 
 c-test: ctest.c ctest.h
 	$(CC) $(CFLAGS) -o $@ ctest.c
@@ -43,8 +45,8 @@ sizes: example app app-notest
 	@size example app app-notest
 
 clean:
-	rm -f c-test example app app-notest libtest ctest_preload.so
+	rm -f c-test example app app-notest libtest crash ctest_preload.so /tmp/ctest_flaky_marker
 
-# Rebuild everything with warnings as errors under ISO C99.
+# Rebuild everything with warnings as errors.
 strict:
-	$(MAKE) clean all CFLAGS="-std=c99 -Wall -Wextra -pedantic -Werror -Wno-missing-field-initializers"
+	$(MAKE) clean all CFLAGS="-std=gnu99 -Wall -Wextra -Werror -Wno-missing-field-initializers"
