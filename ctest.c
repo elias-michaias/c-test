@@ -502,6 +502,8 @@ static void ct_bin_collect(const ct_opts *o, ct_bin *b) {
     char *save = NULL;
     for (char *line = strtok_r(out, "\n", &save); line;
          line = strtok_r(NULL, "\n", &save)) {
+        size_t ll = strlen(line);
+        if (ll > 0 && line[ll - 1] == '\r') line[--ll] = '\0';
         if (!*line) continue;
         char *f[4];
         int nf = ct_splittab(line, f, 4);
@@ -654,6 +656,9 @@ static int ct_parse_result(const char *buf, ct_det *d) {
     char *cur_desc = NULL;
     for (char *line = strtok_r(copy, "\n", &save); line;
          line = strtok_r(NULL, "\n", &save)) {
+        /* Strip trailing \r for Windows CRLF pipe output. */
+        size_t ll = strlen(line);
+        if (ll > 0 && line[ll - 1] == '\r') line[--ll] = '\0';
         if (!got && strncmp(line, "result\t", 7) == 0) {
             char *f[4];
             if (ct_splittab(line + 7, f, 4) < 2) continue;
