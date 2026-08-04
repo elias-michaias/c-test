@@ -347,3 +347,42 @@ it("no leak: no alloc")
         (void)x;
     });
 }
+
+/* ── expect_no_alloc tests ────────────────────────────────────────────── */
+
+it("no alloc: stack only")
+{
+    expect_no_alloc({
+        int x = 1 + 2;
+        (void)x;
+    });
+}
+
+it("no alloc: detects malloc", .known = "intentional")
+{
+    expect_no_alloc({
+        char *p = (char *)malloc(16);
+        free(p);
+    });
+}
+
+/* ── expect_no_overflow tests ─────────────────────────────────────────── */
+
+static void write_safe(unsigned char *dst, size_t n)   { memset(dst, 0xFF, n); }
+static void write_overrun(unsigned char *dst, size_t n) { memset(dst, 0xFF, n + 4); }
+
+it("no overflow: safe write")
+{
+    unsigned char buf[32];
+    expect_no_overflow(buf, {
+        write_safe(arr, 32);
+    });
+}
+
+it("no overflow: detects overrun", .known = "intentional")
+{
+    unsigned char buf[32];
+    expect_no_overflow(buf, {
+        write_overrun(arr, 32);
+    });
+}

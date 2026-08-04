@@ -756,8 +756,9 @@ static int ct_seh_filter(unsigned int code, int sig) {
 #    define ct_usable_size(p) malloc_usable_size(p)
 #  endif
 
-/* Live allocation balance (bytes); only the DELTA across a block matters. */
+/* Live allocation balance (bytes) and call count; only DELTAs matter. */
 static long ct_alloc_live;
+static long ct_alloc_calls;
 
 /* Pointers to the real allocator functions. */
 static void *(*ct_r_malloc)(size_t)            = NULL;
@@ -792,7 +793,7 @@ void *malloc(size_t n) {
         return NULL;
     }
     void *p = ct_r_malloc(n);
-    if (p) ct_alloc_live += (long)ct_usable_size(p);
+    if (p) { ct_alloc_live += (long)ct_usable_size(p); ct_alloc_calls++; }
     return p;
 }
 
@@ -810,7 +811,7 @@ void *calloc(size_t n, size_t s) {
         return p;
     }
     void *p = ct_r_calloc(n, s);
-    if (p) ct_alloc_live += (long)ct_usable_size(p);
+    if (p) { ct_alloc_live += (long)ct_usable_size(p); ct_alloc_calls++; }
     return p;
 }
 
@@ -838,6 +839,15 @@ void *realloc(void *old, size_t n) {
                 "expect_no_leak",                                               \
                 "heap grew after block (possible leak)");                       \
     } while (0)
+#  define expect_no_alloc(block)                                              \
+    do {                                                                        \
+        long _ct_calls = ct_alloc_calls;                                        \
+        do block while (0);                                                     \
+        if (ct_alloc_calls > _ct_calls)                                         \
+            ctest_expect(0, __FILE__, __LINE__,                                 \
+                "expect_no_alloc",                                              \
+                "unexpected heap allocation in block");                         \
+    } while (0)
 
 #elif defined(_MSC_VER) && defined(_DEBUG) && defined(CTEST)
 #  define expect_no_leak(block)                                               \
@@ -851,12 +861,60 @@ void *realloc(void *old, size_t n) {
                 "expect_no_leak",                                               \
                 "heap grew after block (possible leak)");                       \
     } while (0)
+#  define expect_no_alloc(block) do block while (0)  /* no alloc hook on MSVC */
 
 #else
-/* No heap introspection available, or non-CTEST build: block runs but leak
- * check is skipped. */
-#  define expect_no_leak(block) do block while (0)
+/* No heap introspection available: block runs but checks are skipped. */
+#  define expect_no_leak(block)  do block while (0)
+#  define expect_no_alloc(block) do block while (0)
 #endif
+
+/* expect_no_overflow(src, block)
+ * Detects buffer under/overruns by surrounding a copy of `src` with canary
+ * bytes. Inside the block the wrapped buffer is always available as `arr`
+ * (an unsigned char *). After the block the canaries are verified and data
+ * is copied back to the original array.
+ *
+ * `src` must be a fixed-size array (sizeof(src) must be a constant).
+ *
+ * Usage:
+ *   char buf[32];
+ *   expect_no_overflow(buf, {
+ *       some_write_fn(arr, input);   // arr = canary-wrapped copy of buf
+ *   });
+ */
+#define CT_CANARY_N  16
+#define CT_CANARY_B  ((unsigned char)0xAB)
+
+#define expect_no_overflow(src, block)                                          \
+    do {                                                                        \
+        enum { _ct_ofl_n = (int)(sizeof(src)) };                               \
+        unsigned char _ct_ofl_buf[(size_t)(CT_CANARY_N + _ct_ofl_n + CT_CANARY_N)]; \
+        unsigned char *_ct_ofl_data = _ct_ofl_buf + CT_CANARY_N;              \
+        memset(_ct_ofl_buf, CT_CANARY_B, CT_CANARY_N);                        \
+        memcpy(_ct_ofl_data, (const void *)(src), (size_t)_ct_ofl_n);        \
+        memset(_ct_ofl_data + (size_t)_ct_ofl_n, CT_CANARY_B, CT_CANARY_N);  \
+        {                                                                       \
+            unsigned char *arr = _ct_ofl_data;                                  \
+            do block while (0);                                                 \
+        }                                                                       \
+        memcpy((void *)(src), _ct_ofl_data, (size_t)_ct_ofl_n);               \
+        int _ct_ofl_under = 0, _ct_ofl_over = 0;                               \
+        for (int _ct_i = 0; _ct_i < CT_CANARY_N; _ct_i++) {                   \
+            if (_ct_ofl_buf[_ct_i] != CT_CANARY_B) { _ct_ofl_under = 1; break; } \
+        }                                                                       \
+        for (int _ct_i = 0; _ct_i < CT_CANARY_N; _ct_i++) {                   \
+            if (_ct_ofl_data[(size_t)_ct_ofl_n + _ct_i] != CT_CANARY_B) {     \
+                _ct_ofl_over = 1; break;                                        \
+            }                                                                   \
+        }                                                                       \
+        if (_ct_ofl_under)                                                      \
+            ctest_expect(0, __FILE__, __LINE__, "expect_no_overflow",           \
+                         "buffer underrun: write before start of array");       \
+        if (_ct_ofl_over)                                                       \
+            ctest_expect(0, __FILE__, __LINE__, "expect_no_overflow",           \
+                         "buffer overrun: write past end of array");            \
+    } while (0)
 
 static int ct_stristr(const char *hay, const char *needle) {
     size_t nh = strlen(hay), nn = strlen(needle);
@@ -1962,7 +2020,9 @@ int ctest_run(int argc, char **argv) {
 #define expect(...) CT_NCT_SELECT(__VA_ARGS__, CT_NOP_2, CT_NOP_1, 0)(__VA_ARGS__)
 #define expect_signal(sig, ...) ((void)(0 && (sig)))
 #define expect_abort(...) expect_signal(SIGABRT, __VA_ARGS__)
-#define expect_no_leak(block) do block while (0)
+#define expect_no_leak(block)    do block while (0)
+#define expect_no_alloc(block)   do block while (0)
+#define expect_no_overflow(src, block) do { unsigned char *arr = (unsigned char *)(void *)(src); do block while (0); } while (0)
 
 #endif
 
