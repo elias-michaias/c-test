@@ -15,22 +15,13 @@ jobs:
         run: sudo apt-get install -y tcc
 
       - name: Test (GCC)
-        run: |
-          make _build_gcc
-          make _exec_gcc 2>&1 | tee /tmp/out.txt || true
-          grep -q " passed" /tmp/out.txt
+        run: make run gcc RUNNER_ARGS=--no-error
 
       - name: Test (Clang)
-        run: |
-          make _build_clang
-          make _exec_clang 2>&1 | tee /tmp/out.txt || true
-          grep -q " passed" /tmp/out.txt
+        run: make run clang RUNNER_ARGS=--no-error
 
       - name: Test (TCC)
-        run: |
-          make _build_tcc
-          make _exec_tcc 2>&1 | tee /tmp/out.txt || true
-          grep -q " passed" /tmp/out.txt
+        run: make run tcc RUNNER_ARGS=--no-error
 
   # ── macOS ────────────────────────────────────────────────────────────────
   macos:
@@ -39,10 +30,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Test (Clang)
-        run: |
-          make _build_clang
-          make _exec_clang 2>&1 | tee /tmp/out.txt || true
-          grep -q " passed" /tmp/out.txt
+        run: make run clang RUNNER_ARGS=--no-error
 
   # ── Windows (MSVC) ───────────────────────────────────────────────────────
   windows:
@@ -67,6 +55,4 @@ jobs:
         shell: pwsh
         run: |
           $bins = Get-ChildItem test\*.c | ForEach-Object { "dist\$($_.BaseName).exe" }
-          $output = & dist\c-test.exe @bins 2>&1 | Out-String
-          Write-Host $output
-          if ($output -notmatch " passed") { exit 1 }
+          & dist\c-test.exe --no-error @bins

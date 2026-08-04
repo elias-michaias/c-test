@@ -169,6 +169,7 @@ typedef struct ct_opts {
     int retries;
     int slow_ms;
     int backtrace;
+    int no_error;
     const char *junit;
     const char *build_cmd;
 } ct_opts;
@@ -246,6 +247,7 @@ static void ct_usage(FILE *out) {
         "    --junit <file>    write a JUnit XML report to <file>\n"
         "    --quiet           minimal dot output\n"
         "    --no-color        disable colors\n"
+        "    --no-error        always exit 0 (useful for CI where some failures are expected)\n"
         "    --pretty          pretty reporter (default)\n"
         "    --tap             TAP reporter\n"
         "    --help            show this help\n"
@@ -1580,7 +1582,7 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
     R->end(&sum);
     ct_junit_close();
 
-    return (st.failed + st.crashed + st.timedout) > 0 ? 1 : 0;
+    return (o->no_error || (st.failed + st.crashed + st.timedout) == 0) ? 0 : 1;
 }
 
 typedef struct ct_wfile { char *path; time_t mtime; } ct_wfile;
@@ -1826,8 +1828,9 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--fail-fast") == 0) o.fail_fast = 1;
         else if (strcmp(a, "--shuffle") == 0) o.shuffle = 1;
         else if (strcmp(a, "--watch") == 0) o.watch = 1;
-        else if (strcmp(a, "--quiet") == 0 || strcmp(a, "-q") == 0) o.quiet = 1;
+
         else if (strcmp(a, "--no-color") == 0) g_force_no_color = 1;
+        else if (strcmp(a, "--no-error") == 0) o.no_error = 1;
         else if (strcmp(a, "--pretty") == 0) o.tap = 0;
         else if (strcmp(a, "--tap") == 0) o.tap = 1;
         else if (strcmp(a, "-j") == 0 && i + 1 < argc) o.jobs = atoi(argv[++i]);

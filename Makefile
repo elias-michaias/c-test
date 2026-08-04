@@ -24,6 +24,7 @@ ifeq (run++,$(firstword $(MAKECMDGOALS)))
   $(eval $(COMPILER):;@:)
 endif
 COMPILER ?= gcc
+RUNNER_ARGS ?=
 
 # ---------- paths -----------------------------------------------------------
 DIST     := dist
@@ -76,7 +77,7 @@ _build_gcc: _ensure_dist
 	done
 
 _exec_gcc:
-	$(DIST)/c-test $(patsubst $(TEST_DIR)/%.c,$(DIST)/%,$(TEST_SRCS))
+	$(DIST)/c-test $(RUNNER_ARGS) $(patsubst $(TEST_DIR)/%.c,$(DIST)/%,$(TEST_SRCS))
 
 _build_cxx_gcc: _ensure_dist
 	gcc -std=$(STD) $(WARN) $(DBGFLAG) -o $(DIST)/c-test ctest.c
@@ -87,7 +88,7 @@ _build_cxx_gcc: _ensure_dist
 	done
 
 _exec_cxx_gcc:
-	$(DIST)/c-test $(patsubst $(TEST_DIR)/%.cpp,$(DIST)/%,$(TEST_CXX_SRCS))
+	$(DIST)/c-test $(RUNNER_ARGS) $(patsubst $(TEST_DIR)/%.cpp,$(DIST)/%,$(TEST_CXX_SRCS))
 
 # --- TCC -------------------------------------------------------------------
 _build_tcc: _ensure_dist
@@ -99,7 +100,7 @@ _build_tcc: _ensure_dist
 	done
 
 _exec_tcc:
-	$(DIST)/c-test $(patsubst $(TEST_DIR)/%.c,$(DIST)/%,$(TEST_SRCS))
+	$(DIST)/c-test $(RUNNER_ARGS) $(patsubst $(TEST_DIR)/%.c,$(DIST)/%,$(TEST_SRCS))
 
 # --- Clang -----------------------------------------------------------------
 _build_clang: _ensure_dist
@@ -111,7 +112,7 @@ _build_clang: _ensure_dist
 	done
 
 _exec_clang:
-	$(DIST)/c-test $(patsubst $(TEST_DIR)/%.c,$(DIST)/%,$(TEST_SRCS))
+	$(DIST)/c-test $(RUNNER_ARGS) $(patsubst $(TEST_DIR)/%.c,$(DIST)/%,$(TEST_SRCS))
 
 _build_cxx_clang: _ensure_dist
 	clang -std=$(STD) $(WARN) $(DBGFLAG) -o $(DIST)/c-test ctest.c
@@ -122,7 +123,7 @@ _build_cxx_clang: _ensure_dist
 	done
 
 _exec_cxx_clang:
-	$(DIST)/c-test $(patsubst $(TEST_DIR)/%.cpp,$(DIST)/%,$(TEST_CXX_SRCS))
+	$(DIST)/c-test $(RUNNER_ARGS) $(patsubst $(TEST_DIR)/%.cpp,$(DIST)/%,$(TEST_CXX_SRCS))
 
 # --- MSVC ------------------------------------------------------------------
 TEST_EXES := $(patsubst $(TEST_DIR)/%.c,$(DIST)/%.exe,$(TEST_SRCS))
@@ -137,7 +138,7 @@ _build_msvc: _ensure_dist
 	done
 
 _exec_msvc:
-	WINEDLLOVERRIDES="winedbg.exe=" WINEDEBUG=fixme-all wine $(DIST)/c-test.exe $(patsubst $(TEST_DIR)/%.c,$(DIST)/%.exe,$(TEST_SRCS))
+	WINEDLLOVERRIDES="winedbg.exe=" WINEDEBUG=fixme-all wine $(DIST)/c-test.exe $(RUNNER_ARGS) $(patsubst $(TEST_DIR)/%.c,$(DIST)/%.exe,$(TEST_SRCS))
 
 _build_cxx_msvc: _ensure_dist
 	wineserver -k || true
@@ -149,7 +150,7 @@ _build_cxx_msvc: _ensure_dist
 	done
 
 _exec_cxx_msvc:
-	WINEDLLOVERRIDES="winedbg.exe=" WINEDEBUG=fixme-all wine $(DIST)/c-test.exe $(patsubst $(TEST_DIR)/%.cpp,$(DIST)/%.exe,$(TEST_CXX_SRCS))
+	WINEDLLOVERRIDES="winedbg.exe=" WINEDEBUG=fixme-all wine $(DIST)/c-test.exe $(RUNNER_ARGS) $(patsubst $(TEST_DIR)/%.cpp,$(DIST)/%.exe,$(TEST_CXX_SRCS))
 
 # --- helpers ----------------------------------------------------------------
 _ensure_dist:

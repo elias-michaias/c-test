@@ -517,6 +517,10 @@ static void CT_UNUSED ct_noop_after_each(void) {}
     _Pragma("clang diagnostic ignored \"-Wdeprecated-non-prototype\"")       \
     _Pragma("clang diagnostic ignored \"-Wmissing-field-initializers\"")
 #define CT_DIAG_POP _Pragma("clang diagnostic pop")
+#elif defined(__TINYC__)
+/* TCC claims __GNUC__ but does not support _Pragma — suppress nothing. */
+#define CT_DIAG_PUSH
+#define CT_DIAG_POP
 #elif defined(__GNUC__)
 #define CT_DIAG_PUSH                                                         \
     _Pragma("GCC diagnostic push")                                           \
@@ -555,6 +559,19 @@ static void CT_UNUSED ct_noop_after_each(void) {}
     };                                                                       \
     __declspec(allocate("ct_tst$b")) static const struct ctest_test *        \
         CT_NAME(ct_ptr) = &CT_NAME(ct_rec);
+#elif defined(__TINYC__)
+/* TCC: push via constructor (no __start/__stop section symbols in TCC linker) */
+#define CT_REGISTER(...)                                                     \
+    static const struct ctest_test CT_NAME(ct_rec) = {                      \
+        CT_SPEC_VALUE(__VA_ARGS__),                                          \
+        __FILE__, __LINE__,                                                  \
+        CT_NAME(ct_run),                                                     \
+        CT_PARAM_DATA(__VA_ARGS__), CT_PARAM_ELEM(__VA_ARGS__),              \
+        CT_PARAM_COUNT(__VA_ARGS__),                                         \
+        CT_PARAM_GEN(__VA_ARGS__), CT_PARAM_GCOUNT(__VA_ARGS__)              \
+    };                                                                       \
+    __attribute__((constructor))                                             \
+    static void CT_NAME(ct_ctor)(void) { ct_tcc_push(&CT_NAME(ct_rec)); }
 #else
 #define CT_REGISTER(...)                                                     \
     static const struct ctest_test CT_NAME(ct_rec) = {                      \
@@ -607,7 +624,18 @@ extern const struct ctest_test *section$end$__DATA$ct_tst;
 /* Sentinel pointers at sub-section boundaries; the walker reads [start+1, stop). */
 __declspec(allocate("ct_tst$a")) static const struct ctest_test *ct_msvc_sec_start = NULL;
 __declspec(allocate("ct_tst$z")) static const struct ctest_test *ct_msvc_sec_stop  = NULL;
-#elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__)) || defined(__TINYC__)
+#elif defined(__TINYC__)
+/* TCC's built-in linker does not emit __start_X/__stop_X section symbols.
+ * Use constructor functions to push each test record into a static list. */
+#  define CT_TCC_MAX_TESTS 1024
+static const struct ctest_test *ct_tcc_list[CT_TCC_MAX_TESTS];
+static size_t ct_tcc_nlist;
+static void ct_tcc_push(const struct ctest_test *t) {
+    if (ct_tcc_nlist < CT_TCC_MAX_TESTS) ct_tcc_list[ct_tcc_nlist++] = t;
+}
+#define CT_SEC_PTR_START ((const struct ctest_test * const *)ct_tcc_list)
+#define CT_SEC_PTR_STOP  ((const struct ctest_test * const *)(ct_tcc_list + ct_tcc_nlist))
+#elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__))
 extern const struct ctest_test * const __start_ct_tst[];
 extern const struct ctest_test * const __stop_ct_tst[];
 #define CT_SEC_PTR_START (__start_ct_tst)
@@ -892,13 +920,12 @@ void *realloc(void *old, size_t n) {
         unsigned char _ct_ofl_buf[(size_t)(CT_CANARY_N + _ct_ofl_n + CT_CANARY_N)]; \
         unsigned char *_ct_ofl_data = _ct_ofl_buf + CT_CANARY_N;              \
         memset(_ct_ofl_buf, CT_CANARY_B, CT_CANARY_N);                        \
-        memcpy(_ct_ofl_data, (const void *)(src), (size_t)_ct_ofl_n);        \
+        memset(_ct_ofl_data, 0, (size_t)_ct_ofl_n);                          \
         memset(_ct_ofl_data + (size_t)_ct_ofl_n, CT_CANARY_B, CT_CANARY_N);  \
         {                                                                       \
             unsigned char *arr = _ct_ofl_data;                                  \
             do block while (0);                                                 \
         }                                                                       \
-        memcpy((void *)(src), _ct_ofl_data, (size_t)_ct_ofl_n);               \
         int _ct_ofl_under = 0, _ct_ofl_over = 0;                               \
         for (int _ct_i = 0; _ct_i < CT_CANARY_N; _ct_i++) {                   \
             if (_ct_ofl_buf[_ct_i] != CT_CANARY_B) { _ct_ofl_under = 1; break; } \
