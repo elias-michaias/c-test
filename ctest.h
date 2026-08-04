@@ -584,10 +584,56 @@ static const char *ct_signal_explain(int sig, int st) {
 
 #define expect_abort(...) expect_signal(SIGABRT, __VA_ARGS__)
 
-#else  /* _WIN32: fork() unavailable; signal-based tests are skipped */
+#elif defined(_MSC_VER)
+/*
+ * Windows / MSVC: no fork(), but we have SEH (__try/__except).
+ *
+ * Hardware faults (SIGSEGV, SIGFPE, SIGILL) map directly to Win32 exception
+ * codes that __except can catch.
+ *
+ * abort() raises SIGABRT (a C signal, not a Win32 exception), so we install a
+ * SIGABRT handler that converts it to a custom Win32 exception code, then
+ * catch that with __except too — keeping the implementation uniform.
+ */
+#define CT_ABORT_EXCEPTION 0xE0435400UL  /* user-defined; high bits = error */
+
+static void ct_abort_to_seh(int s) {
+    (void)s;
+    RaiseException(CT_ABORT_EXCEPTION, 0, 0, NULL);
+}
+
+static int ct_seh_filter(unsigned int code, int sig) CT_UNUSED;
+static int ct_seh_filter(unsigned int code, int sig) {
+    unsigned int want;
+    switch (sig) {
+        case SIGABRT: want = CT_ABORT_EXCEPTION;           break;
+        case SIGSEGV: want = EXCEPTION_ACCESS_VIOLATION;   break;
+        case SIGFPE:  want = EXCEPTION_INT_DIVIDE_BY_ZERO; break;
+        case SIGILL:  want = EXCEPTION_ILLEGAL_INSTRUCTION;break;
+        default:      return EXCEPTION_CONTINUE_SEARCH;
+    }
+    return (code == want) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+#define expect_signal(sig, ...) do {                                             \
+    void (*_ct_ha)(int) = (void(*)(int))NULL;                                    \
+    if ((sig) == SIGABRT) _ct_ha = signal(SIGABRT, ct_abort_to_seh);           \
+    volatile int _ct_ok = 0;                                                     \
+    __try { __VA_ARGS__; }                                                       \
+    __except (ct_seh_filter((unsigned int)GetExceptionCode(), (sig))) {         \
+        _ct_ok = 1;                                                              \
+    }                                                                            \
+    if (_ct_ha) signal(SIGABRT, _ct_ha);                                         \
+    ctest_expect((int)_ct_ok, __FILE__, __LINE__,                               \
+        "expect_signal(" #sig ")", "expected signal was not raised");           \
+} while (0)
+
+#define expect_abort(...) expect_signal(SIGABRT, __VA_ARGS__)
+
+#else  /* _WIN32 but not _MSC_VER (e.g. MinGW): no SEH */
 #define expect_signal(sig, ...) ((void)(sig))
 #define expect_abort(...)       ((void)0)
-#endif /* _WIN32 */
+#endif
 
 static int ct_stristr(const char *hay, const char *needle) {
     size_t nh = strlen(hay), nn = strlen(needle);
