@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ── Linux ────────────────────────────────────────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install TCC
+        run: sudo apt-get install -y tcc
+
+      - name: Test (GCC)
+        run: |
+          make _build_gcc
+          make _exec_gcc 2>&1 | tee /tmp/out.txt || true
+          grep -q " passed" /tmp/out.txt
+
+      - name: Test (Clang)
+        run: |
+          make _build_clang
+          make _exec_clang 2>&1 | tee /tmp/out.txt || true
+          grep -q " passed" /tmp/out.txt
+
+      - name: Test (TCC)
+        run: |
+          make _build_tcc
+          make _exec_tcc 2>&1 | tee /tmp/out.txt || true
+          grep -q " passed" /tmp/out.txt
+
+  # ── macOS ────────────────────────────────────────────────────────────────
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test (Clang)
+        run: |
+          make _build_clang
+          make _exec_clang 2>&1 | tee /tmp/out.txt || true
+          grep -q " passed" /tmp/out.txt
+
+  # ── Windows (MSVC) ───────────────────────────────────────────────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build (MSVC)
+        shell: pwsh
+        run: |
+          New-Item -Force -ItemType Directory dist | Out-Null
+          cl /W3 /nologo /D_CRT_SECURE_NO_WARNINGS ctest.c /Fo:dist\ /Fe:dist\c-test.exe
+          foreach ($src in Get-ChildItem test\*.c) {
+            $name = $src.BaseName
+            Write-Host "  cl $name"
+            cl /W3 /nologo /D_CRT_SECURE_NO_WARNINGS /I. /DCTEST $src /Fo:dist\ /Fe:dist\$name.exe
+          }
+
+      - name: Test (MSVC)
+        shell: pwsh
+        run: |
+          $bins = Get-ChildItem test\*.c | ForEach-Object { "dist\$($_.BaseName).exe" }
+          $output = & dist\c-test.exe @bins 2>&1 | Out-String
+          Write-Host $output
+          if ($output -notmatch " passed") { exit 1 }
