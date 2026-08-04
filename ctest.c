@@ -193,6 +193,7 @@ typedef struct ct_run {
     const char *file;
     int line;
     int timeout_ms;  /* per-test timeout from --list (0 = none) */
+    unsigned seed;   /* for generate() reproducibility */
 } ct_run;
 
 static void ct_usage(FILE *out) {
@@ -361,7 +362,8 @@ static int ct_capture(const char *bin, char *const argv[], char **out) {
     return (int)code;
 }
 
-static HANDLE ct_spawn(const char *bin, const char *name, HANDLE *rh_out) {
+static HANDLE ct_spawn(const char *bin, const char *name, HANDLE *rh_out,
+                       unsigned seed) {
     SECURITY_ATTRIBUTES sa;
     memset(&sa, 0, sizeof sa);
     sa.nLength = sizeof sa;
@@ -370,8 +372,8 @@ static HANDLE ct_spawn(const char *bin, const char *name, HANDLE *rh_out) {
     if (!CreatePipe(&rh, &wh, &sa, 0)) return INVALID_HANDLE_VALUE;
     SetHandleInformation(rh, HANDLE_FLAG_INHERIT, 0);
     char cmdline[8192];
-    /* Simple quoting; test names don't normally contain '"'. */
-    snprintf(cmdline, sizeof cmdline, "\"%s\" --run \"%s\"", bin, name);
+    snprintf(cmdline, sizeof cmdline, "\"%s\" --run \"%s\" --seed %u",
+             bin, name, seed);
     STARTUPINFOA si;
     memset(&si, 0, sizeof si);
     si.cb = sizeof si;
@@ -433,7 +435,8 @@ static int ct_capture(const char *bin, char *const argv[], char **out) {
     return st;
 }
 
-static pid_t ct_spawn(const char *bin, const char *name, int *rfd) {
+static pid_t ct_spawn(const char *bin, const char *name, int *rfd,
+                      unsigned seed) {
     int p[2];
     if (pipe(p) < 0) return -1;
     fflush(NULL);
@@ -449,7 +452,9 @@ static pid_t ct_spawn(const char *bin, const char *name, int *rfd) {
         dup2(p[1], 2);
         close(p[1]);
         ct_setup_child();
-        execl(bin, bin, "--run", name, (char *)NULL);
+        char seedbuf[32];
+        snprintf(seedbuf, sizeof seedbuf, "%u", seed);
+        execl(bin, bin, "--run", name, "--seed", seedbuf, (char *)NULL);
         _exit(127);
     }
     close(p[1]);
@@ -1282,13 +1287,13 @@ static void ct_gdb_backtrace(const ct_run *t) {
 static int ct_slot_spawn(ct_slot *s, const ct_run *t, int retries) {
 #ifdef _WIN32
     HANDLE rh;
-    HANDLE proc = ct_spawn(t->bin, t->name, &rh);
+    HANDLE proc = ct_spawn(t->bin, t->name, &rh, t->seed);
     if (proc == INVALID_HANDLE_VALUE) return -1;
     s->proc    = proc;
     s->pipe_rh = rh;
 #else
     int fd;
-    pid_t pid = ct_spawn(t->bin, t->name, &fd);
+    pid_t pid = ct_spawn(t->bin, t->name, &fd, t->seed);
     if (pid < 0) return -1;
     s->pid = pid;
     s->fd  = fd;
@@ -1782,6 +1787,7 @@ static int ct_collect_all(const ct_opts *o, ct_bin *bins, ct_run **runs_out,
             runs[n].file = bins[b].tests[i].file;
             runs[n].line = bins[b].tests[i].line;
             runs[n].timeout_ms = bins[b].tests[i].timeout_ms;
+            runs[n].seed = o->seed;
             n++;
         }
     }

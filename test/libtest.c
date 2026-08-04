@@ -302,3 +302,48 @@ it("this is an extremely long parameterized test name that overflows the "
 {
     expect(it == 1 || it == 2, "long-name cases");
 }
+
+/* ── generate() tests ─────────────────────────────────────────────────── */
+
+typedef struct { int a; int b; } gen_add_case_t;
+
+/* Generator: produces random pairs of small ints */
+static void gen_add_case(void *out) {
+    gen_add_case_t *c = (gen_add_case_t *)out;
+    c->a = rand() % 100;
+    c->b = rand() % 100;
+}
+
+it("generate addition", generate(gen_add_case_t, gen_add_case, 20))
+{
+    expect(it.a + it.b >= 0, "sum is non-negative");
+}
+
+/* Generator that always produces a known value (determinism check) */
+static void gen_const(void *out) {
+    int *p = (int *)out;
+    *p = 42;
+}
+
+it("generate constant", generate(int, gen_const, 5))
+{
+    expect(it == 42, "generated value is always 42");
+}
+
+/* ── expect_no_leak tests ─────────────────────────────────────────────── */
+
+it("no leak: alloc and free")
+{
+    expect_no_leak({
+        char *p = (char *)malloc(64);
+        free(p);
+    });
+}
+
+it("no leak: no alloc")
+{
+    expect_no_leak({
+        int x = 1 + 2;
+        (void)x;
+    });
+}

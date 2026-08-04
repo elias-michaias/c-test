@@ -114,6 +114,31 @@
 #define CT_LAST_ARG(...) CT_ARG_N(CT_NARG(__VA_ARGS__), __VA_ARGS__)
 #define CT_HAS_CASES(...) CT_IS_PAREN(CT_LAST_ARG(__VA_ARGS__))
 
+/* CT_HAS_GEN: detect generate() vs cases() without using ## on computed
+ * values (which breaks MSVC's legacy preprocessor when the value comes
+ * from a MACRO paren rescan).
+ *
+ * Strategy: generate(type, fn, n) expands to ((type, fn, n)) — a double
+ * paren.  CT_HAS_GEN_1 uses CT_IS_GEN_PROBE to extract the FIRST element
+ * of the last arg and checks whether IT is itself a paren:
+ *   cases(int, arr) → last arg = (int, arr)  → first elem = int  → not paren → 0
+ *   generate(int,f,n) → last arg = ((int,f,n)) → first elem = (int,f,n) → paren → 1
+ *
+ * On MSVC's legacy preprocessor the bare `MACRO paren` rescan trick fails
+ * when the paren comes from a macro parameter substitution — MSVC doesn't
+ * re-invoke the function-like macro after the substitution.  The workaround
+ * is to wrap every `MACRO_I paren` call inside CT_EXPAND(...) so that the
+ * argument-evaluation pass forces a second scan:
+ *   CT_EXPAND(MACRO_I paren)  →  CT_EXPAND evaluates arg  →  MACRO_I( ) called
+ * Similarly, CT_IS_PAREN_PROBE must be forced via CT_IS_PAREN(a) (which wraps
+ * in CT_CHECK) rather than the bare `CT_IS_PAREN_PROBE a` space-trick. */
+#define CT_IS_GEN_PROBE_I(a, ...) CT_IS_PAREN(a)
+#define CT_IS_GEN_PROBE(paren) CT_EXPAND(CT_IS_GEN_PROBE_I paren)
+#define CT_HAS_GEN(...) CT_HAS_GEN_I(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
+#define CT_HAS_GEN_I(c, ...) CT_CAT(CT_HAS_GEN_, c)(__VA_ARGS__)
+#define CT_HAS_GEN_0(...) 0
+#define CT_HAS_GEN_1(...) CT_IS_GEN_PROBE(CT_LAST_ARG(__VA_ARGS__))
+
 #define CT_SIG_IF(...) CT_SIG_IF_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_SIG_IF_II(c, ...) CT_CAT(CT_SIG_IF_, c)(__VA_ARGS__)
 #define CT_SIG_IF_0(...) (void)
@@ -145,21 +170,59 @@
 #define CT_PARAM_TYPE(...)   CT_PARAM_TYPE_WRAP(CT_LAST_ARG(__VA_ARGS__))
 #define CT_PARAM_ARRAY(...)  CT_PARAM_ARRAY_WRAP(CT_LAST_ARG(__VA_ARGS__))
 
+/* generate(type, fn, n): like cases() but calls fn(void *out) n times at
+ * runtime to produce test values. type and fn must be single tokens; n must
+ * be a single integer literal or #define'd constant.
+ *
+ * Expands to ((type, fn, n)) — a double-paren — so CT_HAS_GEN can
+ * distinguish it from cases() = (type, array) by checking whether the first
+ * element of the last paren is itself a paren. */
+#define generate(type, fn, n) ((type, fn, n))
+
+/* Inner-tuple extractor: ((type, fn, n)) → (type, fn, n).
+ * CT_EXPAND is required so MSVC's legacy preprocessor rescans the result
+ * of the parameter substitution and actually calls CT_GEN_INNER_I. */
+#define CT_GEN_INNER_I(inner) inner
+#define CT_GEN_INNER(paren)   CT_EXPAND(CT_GEN_INNER_I paren)
+
+#define CT_GEN_TYPE_I(t, fn, n)  t
+#define CT_GEN_FN_I(t, fn, n)    fn
+#define CT_GEN_COUNT_I(t, fn, n) n
+/* Each extractor wraps its inner call in CT_EXPAND so the _I macro is called
+ * on the expanded (type, fn, n) tuple, not left as unexpanded tokens. */
+#define CT_GEN_TYPE_WRAP(inner)   CT_EXPAND(CT_GEN_TYPE_I  inner)
+#define CT_GEN_FN_WRAP(inner)     CT_EXPAND(CT_GEN_FN_I    inner)
+#define CT_GEN_COUNT_WRAP(inner)  CT_EXPAND(CT_GEN_COUNT_I inner)
+#define CT_GEN_TYPE(paren)   CT_GEN_TYPE_WRAP(CT_GEN_INNER(paren))
+#define CT_GEN_FN(paren)     CT_GEN_FN_WRAP(CT_GEN_INNER(paren))
+#define CT_GEN_COUNT(paren)  CT_GEN_COUNT_WRAP(CT_GEN_INNER(paren))
+
 #define CT_PARAM_TYPEDEF_0(...)
-#define CT_PARAM_TYPEDEF_1(...)                                             \
+/* Two-level dispatch: evaluate CT_HAS_GEN as a normal argument (not inside ##)
+ * so MSVC's legacy preprocessor fully expands it before the paste step. */
+#define CT_PARAM_TYPEDEF_1(...)  CT_PARAM_TYPEDEF_1D(CT_HAS_GEN(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_TYPEDEF_1D(g, ...) CT_EXPAND(CT_CAT(CT_PARAM_TYPEDEF_1G_, g)(__VA_ARGS__))
+/* cases: compile-time bounds check + typedef */
+#define CT_PARAM_TYPEDEF_1G_0(...)                                          \
     typedef char CT_NAME(ct_case_ok)                                        \
         [(CT_PARAM_N(CT_PARAM_ARRAY(__VA_ARGS__)) > 0 &&                    \
           CT_PARAM_N(CT_PARAM_ARRAY(__VA_ARGS__)) <= CT_MAX_PARAM_CASES)    \
              ? 1 : -1];                                                     \
     typedef CT_PARAM_TYPE(__VA_ARGS__) CT_NAME(ct_param);
+/* generate: just the typedef; count is a runtime value */
+#define CT_PARAM_TYPEDEF_1G_1(...) \
+    typedef CT_GEN_TYPE(CT_LAST_ARG(__VA_ARGS__)) CT_NAME(ct_param);
 #define CT_PARAM_TYPEDEF(...) CT_PARAM_TYPEDEF_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_PARAM_TYPEDEF_II(c, ...) CT_CAT(CT_PARAM_TYPEDEF_, c)(__VA_ARGS__)
 
 /* In non-test builds `it` keeps the array alive via a pointer so clang's
  * -Wunused-const-variable does not flag case tables that are only read here. */
 #define CT_PARAM_USE_0(...)
-#define CT_PARAM_USE_1(...) static CT_UNUSED const void *                       \
+#define CT_PARAM_USE_1(...)     CT_PARAM_USE_1D(CT_HAS_GEN(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_USE_1D(g, ...) CT_EXPAND(CT_CAT(CT_PARAM_USE_1G_, g)(__VA_ARGS__))
+#define CT_PARAM_USE_1G_0(...) static CT_UNUSED const void *                   \
     CT_NAME(ct_use) = (const void *)CT_PARAM_ARRAY(__VA_ARGS__);
+#define CT_PARAM_USE_1G_1(...)  /* generate: fn is referenced in struct */
 #define CT_PARAM_USE(...) CT_PARAM_USE_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_PARAM_USE_II(c, ...) CT_CAT(CT_PARAM_USE_, c)(__VA_ARGS__)
 
@@ -398,19 +461,47 @@ static void CT_UNUSED ct_noop_after_each(void) {}
 #define CT_SPEC_VALUE_II(c, ...) CT_CAT(CT_SPEC_VALUE_, c)(__VA_ARGS__)
 
 #define CT_PARAM_DATA_0(...) NULL
-#define CT_PARAM_DATA_1(...) (const void *)CT_PARAM_ARRAY(__VA_ARGS__)
+#define CT_PARAM_DATA_1(...)     CT_PARAM_DATA_1D(CT_HAS_GEN(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_DATA_1D(g, ...) CT_EXPAND(CT_CAT(CT_PARAM_DATA_1G_, g)(__VA_ARGS__))
+#define CT_PARAM_DATA_1G_0(...) (const void *)CT_PARAM_ARRAY(__VA_ARGS__)
+#define CT_PARAM_DATA_1G_1(...) NULL
 #define CT_PARAM_DATA(...) CT_PARAM_DATA_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_PARAM_DATA_II(c, ...) CT_CAT(CT_PARAM_DATA_, c)(__VA_ARGS__)
 
 #define CT_PARAM_ELEM_0(...) 0
-#define CT_PARAM_ELEM_1(...) sizeof((CT_PARAM_ARRAY(__VA_ARGS__))[0])
+#define CT_PARAM_ELEM_1(...)     CT_PARAM_ELEM_1D(CT_HAS_GEN(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_ELEM_1D(g, ...) CT_EXPAND(CT_CAT(CT_PARAM_ELEM_1G_, g)(__VA_ARGS__))
+#define CT_PARAM_ELEM_1G_0(...) sizeof((CT_PARAM_ARRAY(__VA_ARGS__))[0])
+#define CT_PARAM_ELEM_1G_1(...) sizeof(CT_GEN_TYPE(CT_LAST_ARG(__VA_ARGS__)))
 #define CT_PARAM_ELEM(...) CT_PARAM_ELEM_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_PARAM_ELEM_II(c, ...) CT_CAT(CT_PARAM_ELEM_, c)(__VA_ARGS__)
 
 #define CT_PARAM_COUNT_0(...) 0
-#define CT_PARAM_COUNT_1(...) CT_PARAM_N(CT_PARAM_ARRAY(__VA_ARGS__))
+#define CT_PARAM_COUNT_1(...)     CT_PARAM_COUNT_1D(CT_HAS_GEN(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_COUNT_1D(g, ...) CT_EXPAND(CT_CAT(CT_PARAM_COUNT_1G_, g)(__VA_ARGS__))
+#define CT_PARAM_COUNT_1G_0(...) CT_PARAM_N(CT_PARAM_ARRAY(__VA_ARGS__))
+#define CT_PARAM_COUNT_1G_1(...) 0
 #define CT_PARAM_COUNT(...) CT_PARAM_COUNT_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_PARAM_COUNT_II(c, ...) CT_CAT(CT_PARAM_COUNT_, c)(__VA_ARGS__)
+
+/* Generator function pointer: non-NULL only for generate() tests. */
+#define CT_PARAM_GEN_0(...) NULL
+#define CT_PARAM_GEN_1(...)     CT_PARAM_GEN_1D(CT_HAS_GEN(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_GEN_1D(g, ...) CT_EXPAND(CT_CAT(CT_PARAM_GEN_1G_, g)(__VA_ARGS__))
+#define CT_PARAM_GEN_1G_0(...) NULL
+#define CT_PARAM_GEN_1G_1(...) \
+    (void (*)(void *))CT_GEN_FN(CT_LAST_ARG(__VA_ARGS__))
+#define CT_PARAM_GEN(...) CT_PARAM_GEN_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_GEN_II(c, ...) CT_CAT(CT_PARAM_GEN_, c)(__VA_ARGS__)
+/* Generate count (only meaningful for generate()): */
+#define CT_PARAM_GCOUNT_0(...) 0
+#define CT_PARAM_GCOUNT_1(...)     CT_PARAM_GCOUNT_1D(CT_HAS_GEN(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_GCOUNT_1D(g, ...) CT_EXPAND(CT_CAT(CT_PARAM_GCOUNT_1G_, g)(__VA_ARGS__))
+#define CT_PARAM_GCOUNT_1G_0(...) 0
+#define CT_PARAM_GCOUNT_1G_1(...) \
+    (size_t)(CT_GEN_COUNT(CT_LAST_ARG(__VA_ARGS__)))
+#define CT_PARAM_GCOUNT(...) CT_PARAM_GCOUNT_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
+#define CT_PARAM_GCOUNT_II(c, ...) CT_CAT(CT_PARAM_GCOUNT_, c)(__VA_ARGS__)
 
 /*
  * The `it` macro relies on a prototype-less forward declaration and on
@@ -459,7 +550,8 @@ static void CT_UNUSED ct_noop_after_each(void) {}
         __FILE__, __LINE__,                                                  \
         CT_NAME(ct_run),                                                     \
         CT_PARAM_DATA(__VA_ARGS__), CT_PARAM_ELEM(__VA_ARGS__),              \
-        CT_PARAM_COUNT(__VA_ARGS__)                                          \
+        CT_PARAM_COUNT(__VA_ARGS__),                                         \
+        CT_PARAM_GEN(__VA_ARGS__), CT_PARAM_GCOUNT(__VA_ARGS__)              \
     };                                                                       \
     __declspec(allocate("ct_tst$b")) static const struct ctest_test *        \
         CT_NAME(ct_ptr) = &CT_NAME(ct_rec);
@@ -470,7 +562,8 @@ static void CT_UNUSED ct_noop_after_each(void) {}
         __FILE__, __LINE__,                                                  \
         CT_NAME(ct_run),                                                     \
         CT_PARAM_DATA(__VA_ARGS__), CT_PARAM_ELEM(__VA_ARGS__),              \
-        CT_PARAM_COUNT(__VA_ARGS__)                                          \
+        CT_PARAM_COUNT(__VA_ARGS__),                                         \
+        CT_PARAM_GEN(__VA_ARGS__), CT_PARAM_GCOUNT(__VA_ARGS__)              \
     };                                                                       \
     __attribute__((used, section(CT_SECTION_NAME)))                          \
     static const struct ctest_test * const CT_NAME(ct_ptr) =                 \
@@ -495,6 +588,8 @@ typedef struct ctest_test {
     const void *cases_data;
     size_t cases_elem;
     size_t cases_count;
+    void (*cases_gen)(void *out);  /* non-NULL for generate() tests */
+    size_t cases_gen_count;        /* number of cases to generate */
 } ctest_test;
 
 /*
@@ -522,6 +617,7 @@ extern const struct ctest_test * const __stop_ct_tst[];
 static const struct ctest_test **g_tests;
 static size_t g_count;
 static const void *g_case_ptr;
+static unsigned g_seed = 12345; /* seed for generate() — overridden by --seed */
 
 static ctest_failure g_failures[CT_MAX_FAILURES];
 static int g_fail_count;
@@ -633,6 +729,133 @@ static int ct_seh_filter(unsigned int code, int sig) {
 #else  /* _WIN32 but not _MSC_VER (e.g. MinGW): no SEH */
 #define expect_signal(sig, ...) ((void)(sig))
 #define expect_abort(...)       ((void)0)
+#endif
+
+/* ── expect_no_leak ────────────────────────────────────────────────────────
+ * Asserts that no heap memory is net-allocated inside the block.
+ *
+ * Tracks a per-call allocation balance using malloc/free interception.
+ * Platform coverage:
+ *   Linux/macOS (CTEST builds) — intercepted via dlsym(RTLD_NEXT)
+ *   MSVC debug                 — _CrtMemDifference
+ *   Everything else            — no-op (block still executes)
+ *
+ * Usage:
+ *   expect_no_leak({ char *p = malloc(8); free(p); })   // passes
+ *   expect_no_leak({ char *p = malloc(8); (void)p; })   // fails
+ */
+
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(_WIN32) && defined(CTEST)
+#  include <dlfcn.h>
+#  include <string.h>  /* memset */
+#  ifdef __APPLE__
+#    include <malloc/malloc.h>   /* malloc_size on macOS */
+#    define ct_usable_size(p) malloc_size(p)
+#  else
+#    include <malloc.h>          /* malloc_usable_size on Linux */
+#    define ct_usable_size(p) malloc_usable_size(p)
+#  endif
+
+/* Live allocation balance (bytes); only the DELTA across a block matters. */
+static long ct_alloc_live;
+
+/* Pointers to the real allocator functions. */
+static void *(*ct_r_malloc)(size_t)            = NULL;
+static void (*ct_r_free)(void *)               = NULL;
+static void *(*ct_r_calloc)(size_t, size_t)    = NULL;
+static void *(*ct_r_realloc)(void *, size_t)   = NULL;
+
+/* Bootstrap buffer used before dlsym initialises ct_r_calloc.
+ * dlsym itself may call calloc internally on first use. */
+static char   ct_boot_buf[65536];
+static size_t ct_boot_off;
+
+static void __attribute__((constructor)) ct_alloc_init_real(void) {
+    ct_r_malloc  = (void *(*)(size_t))          dlsym(RTLD_NEXT, "malloc");
+    ct_r_free    = (void (*)(void *))           dlsym(RTLD_NEXT, "free");
+    ct_r_calloc  = (void *(*)(size_t, size_t))  dlsym(RTLD_NEXT, "calloc");
+    ct_r_realloc = (void *(*)(void *, size_t))  dlsym(RTLD_NEXT, "realloc");
+}
+
+static int ct_is_boot(const void *p) {
+    const char *c = (const char *)p;
+    return c >= ct_boot_buf && c < ct_boot_buf + sizeof ct_boot_buf;
+}
+
+void *malloc(size_t n) {
+    if (!ct_r_malloc) {
+        if (ct_boot_off + n + 16 <= sizeof ct_boot_buf) {
+            void *p = ct_boot_buf + ct_boot_off;
+            ct_boot_off = (ct_boot_off + n + 15u) & ~15u;
+            return p;
+        }
+        return NULL;
+    }
+    void *p = ct_r_malloc(n);
+    if (p) ct_alloc_live += (long)ct_usable_size(p);
+    return p;
+}
+
+void free(void *p) {
+    if (!p || ct_is_boot(p)) return;
+    if (ct_r_free) ct_alloc_live -= (long)ct_usable_size(p);
+    if (ct_r_free) ct_r_free(p);
+}
+
+void *calloc(size_t n, size_t s) {
+    if (!ct_r_calloc) {
+        size_t total = n * s;
+        void *p = malloc(total);
+        if (p) memset(p, 0, total);
+        return p;
+    }
+    void *p = ct_r_calloc(n, s);
+    if (p) ct_alloc_live += (long)ct_usable_size(p);
+    return p;
+}
+
+void *realloc(void *old, size_t n) {
+    if (!old) return malloc(n);
+    if (ct_is_boot(old)) {
+        void *p = malloc(n);
+        if (p) memcpy(p, old, n); /* conservative: old size unknown */
+        return p;
+    }
+    if (!ct_r_realloc) return NULL;
+    long old_sz = (long)ct_usable_size(old);
+    void *p = ct_r_realloc(old, n);
+    if (p) { ct_alloc_live -= old_sz; ct_alloc_live += (long)ct_usable_size(p); }
+    return p;
+}
+
+#  define expect_no_leak(block)                                               \
+    do {                                                                        \
+        long _ct_before = ct_alloc_live;                                        \
+        do block while (0);                                                     \
+        long _ct_after = ct_alloc_live;                                         \
+        if (_ct_after > _ct_before)                                             \
+            ctest_expect(0, __FILE__, __LINE__,                                 \
+                "expect_no_leak",                                               \
+                "heap grew after block (possible leak)");                       \
+    } while (0)
+
+#elif defined(_MSC_VER) && defined(_DEBUG) && defined(CTEST)
+#  define expect_no_leak(block)                                               \
+    do {                                                                        \
+        _CrtMemState _ct_s1, _ct_s2, _ct_diff;                                 \
+        _CrtMemCheckpoint(&_ct_s1);                                             \
+        do block while (0);                                                     \
+        _CrtMemCheckpoint(&_ct_s2);                                             \
+        if (_CrtMemDifference(&_ct_diff, &_ct_s1, &_ct_s2))                    \
+            ctest_expect(0, __FILE__, __LINE__,                                 \
+                "expect_no_leak",                                               \
+                "heap grew after block (possible leak)");                       \
+    } while (0)
+
+#else
+/* No heap introspection available, or non-CTEST build: block runs but leak
+ * check is skipped. */
+#  define expect_no_leak(block) do block while (0)
 #endif
 
 static int ct_stristr(const char *hay, const char *needle) {
@@ -1323,7 +1546,11 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
                        void (*emit_case)(size_t, const char *)) {
     ct_case_descs_clear();
     int timed_out = 0;
-    if (t->cases_count == 0) {
+
+    int is_gen = (t->cases_gen != NULL);
+    size_t count = is_gen ? t->cases_gen_count : t->cases_count;
+
+    if (count == 0 && !is_gen) {
         g_cur_case = -1;
         g_cur_case_desc = NULL;
         g_case_ptr = NULL;
@@ -1353,17 +1580,35 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
 #endif
         return timed_out;
     }
-    if (to > t->cases_count) to = t->cases_count;
+    if (to > count) to = count;
     if (from > to) from = to;
+
+    /* For generate() tests, allocate a reusable buffer for one generated value. */
+    void *gen_buf = NULL;
+    if (is_gen && t->cases_elem > 0) {
+        gen_buf = malloc(t->cases_elem);
+        if (!gen_buf) { fprintf(stderr, "ctest: out of memory\n"); return 0; }
+    }
+
     g_case_desc_n = to - from;
     g_case_descs = g_case_desc_n ? (char **)malloc(g_case_desc_n * sizeof *g_case_descs) : NULL;
+
+    /* Build case descriptions (requires the generated value for generate tests). */
     for (size_t j = from; j < to; j++) {
-        g_case_descs[j - from] = ct_case_desc(
-            (const char *)t->cases_data + j * t->cases_elem, t->cases_elem);
+        const char *elem_ptr;
+        if (is_gen) {
+            /* Seed per-case so order doesn't matter and runs are reproducible. */
+            srand(g_seed ^ (unsigned)(j * 2654435761u));
+            t->cases_gen(gen_buf);
+            elem_ptr = (const char *)gen_buf;
+        } else {
+            elem_ptr = (const char *)t->cases_data + j * t->cases_elem;
+        }
+        g_case_descs[j - from] = ct_case_desc(elem_ptr, t->cases_elem);
         if (emit_case) emit_case(j, g_case_descs[j - from]);
         g_cur_case = (int)j;
         g_cur_case_desc = g_case_descs[j - from];
-        g_case_ptr = (const char *)t->cases_data + j * t->cases_elem;
+        g_case_ptr = elem_ptr;
         int to2 = 0;
 #ifdef _WIN32
         ct_timeout_start(t->spec.timeout);
@@ -1393,6 +1638,7 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
             g_fail_count++;
         }
     }
+    if (gen_buf) free(gen_buf);
     return timed_out;
 }
 
@@ -1436,10 +1682,12 @@ static int ct_run_one(const char *name, int only_mode) {
     for (size_t i = 0; i < g_count; i++) {
         const ctest_test *t = g_tests[i];
         if (strcmp(t->spec.name, base) != 0) continue;
-        if (only >= 0 && (t->cases_count == 0 ||
-                          (size_t)only >= t->cases_count)) {
+        if (only >= 0 && ((t->cases_count == 0 && t->cases_gen == NULL) ||
+                          (t->cases_gen ? (size_t)only >= t->cases_gen_count
+                                        : (size_t)only >= t->cases_count))) {
+            size_t have = t->cases_gen ? t->cases_gen_count : t->cases_count;
             fprintf(stderr, "c-test: %s: no case %d (has %zu)\n",
-                    t->spec.name, only, t->cases_count);
+                    t->spec.name, only, have);
             rc = 2;
             goto done;
         }
@@ -1456,7 +1704,8 @@ static int ct_run_one(const char *name, int only_mode) {
         ctest_before_each();
         int timed_out = ct_run_body(t, only >= 0 ? (size_t)only : 0,
                                     only >= 0 ? (size_t)only + 1
-                                              : t->cases_count,
+                                              : (t->cases_gen ? t->cases_gen_count
+                                                              : t->cases_count),
                                     ct_emit_running);
         ctest_after_each();
         ctest_teardown();
@@ -1522,7 +1771,8 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel,
         g_fail_count = 0;
         double t0 = ct_now();
         ctest_before_each();
-        int timed_out = ct_run_body(t, 0, t->cases_count, NULL);
+        int timed_out = ct_run_body(t, 0, t->cases_gen ? t->cases_gen_count
+                                                        : t->cases_count, NULL);
         ctest_after_each();        res.seconds = ct_now() - t0;
         if (timed_out) {
             res.status = CT_TIMEOUT;
@@ -1650,7 +1900,7 @@ int ctest_run(int argc, char **argv) {
             if (r < 0) bad = 1; else o.exclude = v;
         }
         else if ((r = ct_take(a, "--seed", &v, &i, argc, argv)) != 0) {
-            if (r < 0) bad = 1; else o.seed = (unsigned)strtoul(v, NULL, 10);
+            if (r < 0) bad = 1; else { o.seed = (unsigned)strtoul(v, NULL, 10); g_seed = o.seed; }
         }
         else if ((r = ct_take(a, "--filter", &v, &i, argc, argv)) != 0) {
             if (r < 0) bad = 1;
@@ -1712,6 +1962,7 @@ int ctest_run(int argc, char **argv) {
 #define expect(...) CT_NCT_SELECT(__VA_ARGS__, CT_NOP_2, CT_NOP_1, 0)(__VA_ARGS__)
 #define expect_signal(sig, ...) ((void)(0 && (sig)))
 #define expect_abort(...) expect_signal(SIGABRT, __VA_ARGS__)
+#define expect_no_leak(block) do block while (0)
 
 #endif
 

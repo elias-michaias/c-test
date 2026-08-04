@@ -71,7 +71,7 @@ _build_gcc: _ensure_dist
 	@for src in $(TEST_SRCS); do \
 	    name=$$(basename $$src .c); \
 	    echo "  cc $$name"; \
-	    gcc -std=$(STD) $(WARN) $(DBGFLAG) -I. -DCTEST -o $(DIST)/$$name $$src; \
+	    gcc -std=$(STD) $(WARN) $(DBGFLAG) -I. -DCTEST -o $(DIST)/$$name $$src -ldl; \
 	done
 
 _exec_gcc:
@@ -94,7 +94,7 @@ _build_clang: _ensure_dist
 	@for src in $(TEST_SRCS); do \
 	    name=$$(basename $$src .c); \
 	    echo "  cc $$name"; \
-	    clang -std=$(STD) $(WARN) $(DBGFLAG) -I. -DCTEST -o $(DIST)/$$name $$src; \
+	    clang -std=$(STD) $(WARN) $(DBGFLAG) -I. -DCTEST -o $(DIST)/$$name $$src -ldl; \
 	done
 
 _exec_clang:
