@@ -22,7 +22,7 @@ c-test ./mytest
 ## Build c-test
 
 ```sh
-make run gcc       # or clang / msvc
+make run gcc       # or clang / tcc / msvc
 ```
 
 Output goes to `dist/`. MSVC currently requires [msvc-wine](https://github.com/mstorsjo/msvc-wine).
@@ -32,7 +32,6 @@ Output goes to `dist/`. MSVC currently requires [msvc-wine](https://github.com/m
 ```c
 it("name")                          
 it("name", .skip = 1)                 // always skip
-it("name", .only = 1)                 // run with --only
 it("name", .timeout = 500)            // ms; kills hung tests
 it("name", .platforms = {"linux"})    // skip on other platforms
 it("name", .std = "c11")              // skip unless -std=c11 (or gnu11)
@@ -76,7 +75,46 @@ void my_after_each(void)   { rollback(); }
 #include "ctest.h"
 ```
 
-## Signal / crash assertions
+## Generate (computed parameterized tests)
+
+```c
+typedef struct { int a, b, sum; } triple;
+static void add_cases(triple *out, size_t *n) {
+    for (int i = 0; i < 5; i++) out[(*n)++] = (triple){i, i*2, i*3};
+}
+
+it("add", generate(triple, add_cases, 5)) {
+    expect(it.a + it.b == it.sum);
+}
+```
+
+## Safety assertions
+
+```c
+it("no memory leak") {
+    expect_no_leak({
+        void *p = malloc(64);
+        free(p);        // ok — net zero
+    });
+}
+
+it("no heap allocation") {
+    expect_no_alloc({
+        int x = 1 + 1;  // stack only
+    });
+}
+
+it("no buffer overrun") {
+    unsigned char buf[32];
+    expect_no_overflow(buf, {
+        arr[0] = 0xff;  // arr is the guarded alias for buf
+    });
+}
+```
+
+`expect_no_leak` / `expect_no_alloc` work on Linux and macOS (via `dlsym` interception). `expect_no_overflow` uses canary bytes on all platforms.
+
+
 
 ```c
 it("aborts on bad input") {
@@ -97,7 +135,6 @@ c-test [options] <binary> [binary ...]
 
 --tags <query>     e.g. "math", "math,fast" (OR), "math+fast" (AND), "!slow" (NOT)
 --filter <text>    run tests whose name contains <text> (prefix ! to exclude)
---only             run only tests marked .only = 1
 --shuffle          randomize order; --seed <n> for reproducibility
 --retries <n>      re-run failing tests; flaky tests are reported but not fatal
 --timeout <ms>     global timeout per test (default: none)
@@ -122,5 +159,5 @@ it("std::string") {
 g++ -std=c++11 mytest.cpp -I. -DCTEST -o mytest
 ```
 
-MSVC requires `/std:c++20` (for designated initializers). Field order in `it()` must match declaration order: `skip`, `only`, `platforms`, `std`, `known`, `timeout`, `tags`.
+MSVC requires `/std:c++20` (for designated initializers). Field order in `it()` must match declaration order: `skip`, `platforms`, `std`, `known`, `timeout`, `tags`.
 

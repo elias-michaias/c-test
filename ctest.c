@@ -154,7 +154,6 @@ typedef struct ct_opts {
     const char *exclude;
     const char *tags;
     const char *skip_tags;
-    int only;
     int fail_fast;
     int shuffle;
     unsigned seed;
@@ -219,7 +218,6 @@ static void ct_usage(FILE *out) {
         "                      prefix with ! to exclude)\n"
         "    --match <text>    run tests whose name contains <text> (folded)\n"
         "    --exclude <text>  exclude tests whose name contains <text>\n"
-        "    --only            run only tests marked .only\n"
         "\n"
         "  execution\n"
         "    --fail-fast       stop at the first failing/crashing/timing-out test\n"
@@ -479,7 +477,6 @@ static void ct_bin_collect(const ct_opts *o, ct_bin *b) {
     }
     if (o->match) { argv[n++] = (char *)"--match"; argv[n++] = (char *)o->match; }
     if (o->exclude) { argv[n++] = (char *)"--exclude"; argv[n++] = (char *)o->exclude; }
-    if (o->only) argv[n++] = (char *)"--only";
     argv[n] = NULL;
 
     char *out = NULL;
@@ -1824,7 +1821,6 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--json") == 0) o.json = 1;
         else if (strcmp(a, "--rerun-failed") == 0) o.rerun_failed = 1;
         else if (strcmp(a, "--backtrace") == 0) o.backtrace = 1;
-        else if (strcmp(a, "--only") == 0) o.only = 1;
         else if (strcmp(a, "--fail-fast") == 0) o.fail_fast = 1;
         else if (strcmp(a, "--shuffle") == 0) o.shuffle = 1;
         else if (strcmp(a, "--watch") == 0) o.watch = 1;

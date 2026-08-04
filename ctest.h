@@ -234,7 +234,6 @@
 typedef struct it_t {
     const char *name;
     int skip;
-    int only;
     const char *platforms[CT_MAX_PLATFORMS];
     const char *std;
     const char *known;
@@ -1076,9 +1075,8 @@ static int ct_std_ok(const char *req) {
 
 static char g_reason[128];
 
-static const char *ct_skip_reason(const ctest_test *t, int only_mode) {
+static const char *ct_skip_reason(const ctest_test *t) {
     if (t->spec.skip) return "skipped";
-    if (only_mode && !t->spec.only) return "only-mode";
     if (!ct_platform_ok(t->spec.platforms)) {
         int n = 0;
         char *p = g_reason;
@@ -1459,7 +1457,6 @@ typedef struct ct_opts {
     ct_tagq tags;
     const char *tagq_str;
     const char *skip_tags;
-    int only;
     int fail_fast;
     int shuffle;
     unsigned seed;
@@ -1489,11 +1486,9 @@ static void ct_usage(FILE *out) {
         "                      prefix with ! to exclude)\n"
         "    --match <text>    run tests whose name contains <text> (folded)\n"
         "    --exclude <text>  exclude tests whose name contains <text>\n"
-        "    --only            run only tests marked .only\n"
         "\n"
         "  per-test traits (in it(...), Swift-testing style)\n"
         "    .tags = { \"math\", \"fast\" }  tag the test\n"
-        "    .only = 1              run only this test (with --only)\n"
         "    .skip = 1              always skip\n"
         "    .platforms = {\"linux\"}              only run on listed platforms\n"
         "    .platforms = {\"linux\",\"windows\"}   run on any of the listed platforms\n"
@@ -1743,7 +1738,7 @@ static void ct_print_failures(const ctest_failure *fs, int n) {
     }
 }
 
-static int ct_run_one(const char *name, int only_mode) {
+static int ct_run_one(const char *name) {
     int only = -1;
     char *base = strdup(name);
     size_t blen = strlen(name);
@@ -1777,7 +1772,7 @@ static int ct_run_one(const char *name, int only_mode) {
             goto done;
         }
         double t0 = ct_now();
-        const char *reason = ct_skip_reason(t, only_mode);
+        const char *reason = ct_skip_reason(t);
         if (reason) {
             printf("result\tS\t%.3f\t%s\n", ct_now() - t0, t->spec.name);
             printf("skip\t%s\n", reason);
@@ -1821,8 +1816,7 @@ done:
     return rc;
 }
 
-static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel,
-                      int only_mode) {
+static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel) {
     const ctest_reporter *R = o->quiet ? &ct_quiet : o->tap ? &ct_tap : o->reporter;
     g_name_width = 0;
     for (size_t i = 0; i < nsel; i++) {
@@ -1841,7 +1835,7 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel,
 
     for (size_t k = 0; k < nsel; k++) {
         const ctest_test *t = g_tests[sel[k]];
-        const char *reason = ct_skip_reason(t, only_mode);
+        const char *reason = ct_skip_reason(t);
         ctest_result res = {0};
         res.name = t->spec.name;
         res.file = t->file;
@@ -1960,7 +1954,7 @@ int ctest_run(int argc, char **argv) {
         int r;
         if (strcmp(a, "--help") == 0) { ct_usage(stdout); return 0; }
         else if (strcmp(a, "--list") == 0) o.list = 1;
-        else if (strcmp(a, "--only") == 0) o.only = 1;
+
         else if (strcmp(a, "--fail-fast") == 0) o.fail_fast = 1;
         else if (strcmp(a, "--shuffle") == 0) o.shuffle = 1;
         else if (strcmp(a, "--quiet") == 0 || strcmp(a, "-q") == 0) o.quiet = 1;
@@ -2004,14 +1998,8 @@ int ctest_run(int argc, char **argv) {
         return 2;
     }
 
-    int only_mode = o.only;
-    if (!only_mode) {
-        for (size_t i = 0; i < g_count; i++)
-            if (g_tests[i]->spec.only) { only_mode = 1; break; }
-    }
-
     if (o.list) return ct_list(&o);
-    if (o.run) return ct_run_one(o.run, only_mode);
+    if (o.run) return ct_run_one(o.run);
 
     size_t nsel = 0;
     size_t *sel = NULL;
@@ -2022,7 +2010,7 @@ int ctest_run(int argc, char **argv) {
         ct_shuffle(sel, nsel);
     }
 
-    int rc = ct_execute(&o, sel, nsel, only_mode);
+    int rc = ct_execute(&o, sel, nsel);
     free(sel);
     return rc;
 }
