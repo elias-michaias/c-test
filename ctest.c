@@ -178,6 +178,8 @@ typedef struct ct_btest {
     char *file;
     int line;
     int timeout_ms;
+    char *depends_on;
+    int retry;
 } ct_btest;
 
 typedef struct ct_bin {
@@ -193,6 +195,8 @@ typedef struct ct_run {
     const char *file;
     int line;
     int timeout_ms;  /* per-test timeout from --list (0 = none) */
+    const char *depends_on;
+    int retry;       /* per-test retry count from --list (0 = use global --retries) */
     unsigned seed;   /* for generate() reproducibility */
 } ct_run;
 
@@ -509,8 +513,8 @@ static void ct_bin_collect(const ct_opts *o, ct_bin *b) {
         size_t ll = strlen(line);
         if (ll > 0 && line[ll - 1] == '\r') line[--ll] = '\0';
         if (!*line) continue;
-        char *f[4];
-        int nf = ct_splittab(line, f, 4);
+        char *f[6];
+        int nf = ct_splittab(line, f, 6);
         if (nf < 3) continue;
         int line_no = atoi(f[2]);
         int tms = nf >= 4 ? atoi(f[3]) : 0;
@@ -522,6 +526,8 @@ static void ct_bin_collect(const ct_opts *o, ct_bin *b) {
         b->tests[b->n].file = strdup(f[1]);
         b->tests[b->n].line = line_no;
         b->tests[b->n].timeout_ms = tms;
+        b->tests[b->n].depends_on = (nf >= 5 && f[4][0] != '\0') ? strdup(f[4]) : NULL;
+        b->tests[b->n].retry = nf >= 6 ? atoi(f[5]) : 0;
         b->n++;
     }
     free(out);
@@ -535,6 +541,7 @@ static void ct_bin_free(ct_bin *b) {
     for (int i = 0; i < b->n; i++) {
         free(b->tests[i].name);
         free(b->tests[i].file);
+        free(b->tests[i].depends_on);
     }
     free(b->tests);
     b->tests = NULL;
@@ -1103,6 +1110,32 @@ static char **g_rerun_set;
 static int g_rerun_n;
 static char **g_failed_ids;
 static int g_failed_n;
+static char **g_rdep_failed;
+static int g_rdep_failed_n;
+
+static int ct_rdep_has_failed(const char *name) {
+    if (!name || !*name) return 0;
+    for (int i = 0; i < g_rdep_failed_n; i++)
+        if (strcmp(g_rdep_failed[i], name) == 0) return 1;
+    return 0;
+}
+
+static void ct_rdep_note_failed(const char *name) {
+    char **next;
+    if (!name || ct_rdep_has_failed(name)) return;
+    next = realloc(g_rdep_failed,
+                   (size_t)(g_rdep_failed_n + 1) * sizeof *g_rdep_failed);
+    if (!next) return;
+    g_rdep_failed = next;
+    g_rdep_failed[g_rdep_failed_n++] = strdup(name);
+}
+
+static void ct_rdep_clear_failed(void) {
+    for (int i = 0; i < g_rdep_failed_n; i++) free(g_rdep_failed[i]);
+    free(g_rdep_failed);
+    g_rdep_failed = NULL;
+    g_rdep_failed_n = 0;
+}
 
 static void ct_mkdir_p(const char *path) {
     char *p = strdup(path);
@@ -1360,6 +1393,9 @@ static void ct_finalize(const ct_opts *o, ct_state *st, const ct_run *t,
         }
         break;
     }
+    if ((d->status == CT_FAIL || d->status == CT_CRASH || d->status == CT_TIMEOUT) &&
+        !(d->status == CT_FAIL && d->known))
+        ct_rdep_note_failed(t->name);
     if (d->status != CT_PASS && d->status != CT_SKIP &&
         !(d->status == CT_FAIL && d->known) && st->collect)
         ct_note_failed(t);
@@ -1368,6 +1404,7 @@ static void ct_finalize(const ct_opts *o, ct_state *st, const ct_run *t,
 
 static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect) {
     const ctest_reporter *R = o->tap ? &ct_tap : o->quiet ? &ct_quiet : &ct_pretty;
+    ct_rdep_clear_failed();
     int jobs = o->jobs > 0 ? o->jobs : ct_default_jobs();
     if (jobs > n && n > 0) jobs = n;
     double timeout = o->timeout_ms > 0 ? (double)o->timeout_ms / 1000.0 : 0.0;
@@ -1399,7 +1436,23 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
             if (slots[i].used) continue;
             if (next >= (size_t)n || st.stop) continue;
             const ct_run *t = &tests[next];
-            if (ct_slot_spawn(&slots[i], t, o->retries) != 0) {
+            if (t->depends_on && t->depends_on[0] != '\0' && ct_rdep_has_failed(t->depends_on)) {
+                char reason[256];
+                ctest_result res = {0};
+                snprintf(reason, sizeof reason, "dependency '%s' failed", t->depends_on);
+                res.name = t->name;
+                res.file = t->bin;
+                res.line = t->line;
+                res.status = CT_SKIP;
+                res.skip_reason = reason;
+                ct_junit_test(&res);
+                R->result(&res);
+                st.skipped++;
+                next++;
+                continue;
+            }
+            int eff_retries = t->retry > 0 ? t->retry : o->retries;
+            if (ct_slot_spawn(&slots[i], t, eff_retries) != 0) {
                 ctest_result res = {0};
                 res.name = t->name;
                 res.file = t->bin;
@@ -1413,6 +1466,7 @@ static int ct_execute(const ct_opts *o, const ct_run *tests, int n, int collect)
                 ct_junit_test(&res);
                 R->result(&res);
                 st.failed++;
+                ct_rdep_note_failed(t->name);
                 if (st.collect) ct_note_failed(t);
                 if (o->fail_fast) st.stop = 1;
             }
@@ -1786,6 +1840,8 @@ static int ct_collect_all(const ct_opts *o, ct_bin *bins, ct_run **runs_out,
             runs[n].file = bins[b].tests[i].file;
             runs[n].line = bins[b].tests[i].line;
             runs[n].timeout_ms = bins[b].tests[i].timeout_ms;
+            runs[n].depends_on = bins[b].tests[i].depends_on;
+            runs[n].retry = bins[b].tests[i].retry;
             runs[n].seed = o->seed;
             n++;
         }
@@ -2006,6 +2062,7 @@ int main(int argc, char **argv) {
     free(runs);
 
     ct_rerun_save();
+    ct_rdep_clear_failed();
     for (int i = 0; i < g_failed_n; i++) free(g_failed_ids[i]);
     free(g_failed_ids);
     g_failed_ids = NULL;

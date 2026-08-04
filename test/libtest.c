@@ -3,14 +3,15 @@
 #define ctest_before_each libtest_before_each
 #define ctest_after_each libtest_after_each
 static int g_setup, g_before, g_after;
-void libtest_setup(void) { g_setup++; }
-void libtest_before_each(void) { g_before++; }
-void libtest_after_each(void) { g_after++; }
+void libtest_setup(void);
 #include "ctest.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+void libtest_setup(void) { g_setup++; }
+void libtest_before_each(const it_t *it) { (void)it; g_before++; }
+void libtest_after_each(const it_t *it) { (void)it; g_after++; }
 
 
 it("custom failure message", .tags = {"msg"})
@@ -37,19 +38,19 @@ it("multiply", cases(mult_case, mult_cases))
     expect(it.a * it.b == it.product, "multiplication");
 }
 
-it("expect_abort catches abort", .tags = {"sig"})
+it("catches abort", .abort = 1, .tags = {"sig"})
 {
-    expect_abort({ abort(); });
+    abort();
 }
 
-it("expect_signal catches segfault", .tags = {"sig"})
+it("catches segfault", .signal = SIGSEGV, .tags = {"sig"})
 {
-    expect_signal(SIGSEGV, { *(volatile int *)0 = 1; });
+    *(volatile int *)0 = 1;
 }
 
-it("no signal reported as failure", .tags = {"sig", "broken"})
+it("no abort reported as failure", .abort = 1, .known = "intentional", .tags = {"sig", "broken"})
 {
-    expect_abort({ });
+    /* intentionally does not abort — verifies the failure is detected */
 }
 
 it("hooks run before the body", .tags = {"hooks"})
@@ -59,9 +60,34 @@ it("hooks run before the body", .tags = {"hooks"})
     expect(g_after == 0, "after_each has not run yet");
 }
 
+static int g_per_test_setup = 0, g_per_test_teardown = 0;
+static ctest_status g_teardown_result = (ctest_status)-1;
+static void per_test_setup(const it_t *it)    { (void)it; g_per_test_setup++;    }
+static void per_test_teardown(const it_t *it) { g_per_test_teardown++; g_teardown_result = it->result; }
+
+static void data_setup(const it_t *it) { *(int *)it->data = 42; }
+static int g_data_val;
+
+it("per-test .setup runs before body", .setup = per_test_setup, .tags = {"hooks"})
+{
+    expect(g_per_test_setup == 1, ".setup was called before the body");
+    expect(g_per_test_teardown == 0, ".teardown not called during body");
+}
+
+it(".teardown receives result", .teardown = per_test_teardown, .tags = {"hooks"})
+{
+    /* passes; teardown should see CT_PASS */
+    expect(g_teardown_result == (ctest_status)-1, ".teardown not yet called during body");
+}
+
+it(".data passes context to hooks", .setup = data_setup, .data = &g_data_val, .tags = {"hooks"})
+{
+    expect(g_data_val == 42, ".data was populated by setup");
+}
+
 it("flaky once, then passes", .tags = {"flaky"})
 {
-    const char *p = "/tmp/ctest_flaky_marker";
+    const char *p = "test/.ctest_flaky_marker";
     FILE *f = fopen(p, "r");
     if (f) {
         fclose(f);
@@ -264,12 +290,9 @@ it("c11 param", .std = "c11", cases(std_case, std_cases))
 typedef struct { int should_abort; } sig_case;
 static const sig_case sig_cases[] = { { 0 }, { 1 } };
 
-it("abort per case", cases(sig_case, sig_cases))
+it("abort per case", .abort = 1, cases(sig_case, sig_cases))
 {
-    if (it.should_abort)
-        expect_abort({ abort(); });
-    else
-        expect(1, "no abort expected");
+    abort();
 }
 
 /* exactly CT_MAX_PARAM_CASES cases: the hard compile-time limit */
@@ -327,59 +350,80 @@ it("generate constant", generate(int, gen_const, 5))
     expect(it == 42, "generated value is always 42");
 }
 
-/* ── expect_no_leak tests ─────────────────────────────────────────────── */
+/* ── .leak / .no_alloc tests ──────────────────────────────────────────────── */
 
 it("no leak: alloc and free")
 {
-    expect_no_leak({
-        char *p = (char *)malloc(64);
-        free(p);
-    });
+    char *p = (char *)malloc(64);
+    free(p);
 }
 
 it("no leak: no alloc")
 {
-    expect_no_leak({
-        int x = 1 + 2;
-        (void)x;
-    });
+    int x = 1 + 2;
+    (void)x;
 }
 
-/* ── expect_no_alloc tests ────────────────────────────────────────────── */
-
-it("no alloc: stack only")
+it("no alloc: stack only", .no_alloc = 1)
 {
-    expect_no_alloc({
-        int x = 1 + 2;
-        (void)x;
-    });
+    int x = 1 + 2;
+    (void)x;
 }
 
-it("no alloc: detects malloc", .known = "intentional")
+it("no alloc: detects malloc", .no_alloc = 1, .known = "intentional")
 {
-    expect_no_alloc({
-        char *p = (char *)malloc(16);
-        free(p);
-    });
+    char *p = (char *)malloc(16);
+    free(p);
 }
 
-/* ── expect_no_overflow tests ─────────────────────────────────────────── */
+/* ── .buf / capture / dependency tests ───────────────────────────────── */
 
-static void write_safe(unsigned char *dst, size_t n)   { memset(dst, 0xFF, n); }
+static void write_safe(unsigned char *dst, size_t n)    { memset(dst, 0xFF, n); }
 static void write_overrun(unsigned char *dst, size_t n) { memset(dst, 0xFF, n + 4); }
 
-it("no overflow: safe write")
+it("no overflow: safe write", .buf = 32)
 {
-    unsigned char buf[32];
-    expect_no_overflow(buf, {
-        write_safe(arr, 32);
-    });
+    write_safe(ct_buf, 32);
 }
 
-it("no overflow: detects overrun", .known = "intentional")
+it("no overflow: detects overrun", .buf = 32, .known = "intentional")
 {
-    unsigned char buf[32];
-    expect_no_overflow(buf, {
-        write_overrun(arr, 32);
-    });
+    write_overrun(ct_buf, 32);
+}
+
+it("captures stdout")
+{
+    ct_capture_stdout();
+    printf("hello capture");
+    const char *out = ct_captured();
+    expect(strcmp(out, "hello capture") == 0, "captured output matches");
+}
+
+it("dependency: passes")
+{
+}
+
+it("dependency: failing dep")
+{
+    expect(0, "intentional dependency failure");
+}
+
+it("dependency: skips when dep fails", .depends_on = "dependency: failing dep")
+{
+}
+
+it(".env sets and restores", .env = {{"CTEST_ENV_TEST", "hello"}})
+{
+    expect(strcmp(getenv("CTEST_ENV_TEST"), "hello") == 0, ".env value is set");
+}
+
+it(".env is restored after test")
+{
+    expect(getenv("CTEST_ENV_TEST") == NULL, ".env was cleaned up after previous test");
+}
+
+it(".retry eventually passes", .retry = 3, .known = "intentional")
+{
+    /* always fails; verifies retry count is respected (shown as flaky/fail) */
+    expect(0, "always fails");
 }

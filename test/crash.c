@@ -4,12 +4,12 @@
 #include <unistd.h>
 #endif
 
-it("should segfault", .tags = {"crash"})
+it("should segfault", .signal = SIGSEGV, .tags = {"crash"})
 {
     *(volatile int *)0 = 1;
 }
 
-it("should abort", .tags = {"crash"})
+it("should abort", .abort = 1, .tags = {"crash"})
 {
     abort();
 }

@@ -32,11 +32,18 @@ Output goes to `dist/`. MSVC currently requires [msvc-wine](https://github.com/m
 ```c
 it("name")                          
 it("name", .skip = 1)                 // always skip
+it("name", .abort = 1)                // assert test calls abort()
+it("name", .signal = SIGSEGV)         // assert test raises signal
+it("name", .leak = 1)                 // allow memory leaks (default: assert no leak)
+it("name", .no_alloc = 1)             // assert no heap allocation
 it("name", .timeout = 500)            // ms; kills hung tests
 it("name", .platforms = {"linux"})    // skip on other platforms
 it("name", .std = "c11")              // skip unless -std=c11 (or gnu11)
 it("name", .known = "BUG-42")         // expected failure; reported, not fatal
 it("name", .tags = {"math", "fast"})  // run by tag later 
+it("name", .depends_on = "setup db")  // skip if named test failed earlier
+it("name", .retry = 3)               // retry up to 3 times before marking failed
+it("name", .env = {{"KEY","val"},{0}}) // set env vars for this test; NULL value = unset
 ```
 
 ## Parameterized tests
@@ -61,21 +68,79 @@ it("is prime", cases(int, primes)) {
 
 ## Lifecycle hooks
 
-```c
-void my_setup(void)        { db = connect(); }
-void my_teardown(void)     { disconnect(db); }
-void my_before_each(void)  { begin_tx(); }
-void my_after_each(void)   { rollback(); }
+Global hooks (file-wide):
 
+```c
 #define ctest_setup        my_setup
-#define ctest_teardown     my_teardown
 #define ctest_before_each  my_before_each
 #define ctest_after_each   my_after_each
-
+#define ctest_teardown     my_teardown
 #include "ctest.h"
+
+void my_setup(void)                   { db = connect(); }
+void my_teardown(void)                { disconnect(db); }
+void my_before_each(const it_t *it)   { begin_tx(); }
+void my_after_each(const it_t *it)    { rollback(); }
 ```
 
-## Generate (computed parameterized tests)
+`ctest.h` emits `extern` declarations automatically — no forward declaration needed. The `it_t *` lets you inspect the current test's name, tags, timeout, etc. Use `it->data` for arbitrary per-test context shared with hooks.
+
+Per-test hooks (inline on the test):
+
+```c
+void open_file(const it_t *it)  { g_fp = fopen((const char *)it->data, "rb"); }
+void close_file(const it_t *it) { (void)it; fclose(g_fp); }
+
+it("reads header", .setup = open_file, .teardown = close_file, .data = "data.bin") {
+    expect(read_header(g_fp) == 0);
+}
+```
+
+`.setup` is called with `it->result == CT_PASS` (not yet set). `.teardown` is called after the body with `it->result` populated — use it to log, send metrics, or conditionally clean up:
+
+```c
+void on_done(const it_t *it) {
+    if (it->result == CT_FAIL)
+        log_failure(it->name);
+}
+
+it("my test", .teardown = on_done) { ... }
+```
+
+`.setup` / `.teardown` run after `ctest_before_each` / before `ctest_after_each`. `after_each` also receives the populated `it_t`.
+
+## Signal / crash assertions
+
+```c
+it("aborts on bad input", .abort = 1) {
+    process(NULL);
+}
+
+it("segfaults on null deref", .signal = SIGSEGV) {
+    *(int *)0 = 1;
+}
+```
+
+On POSIX: the test body runs in a `fork()`ed child; the parent verifies it terminated with the expected signal. On Windows (MSVC): uses SEH (`__try`/`__except`).
+
+## Safety assertions
+
+```c
+it("no memory leak") {
+    void *p = malloc(64);
+    free(p);        // passes — net zero
+}
+
+it("intentional leak", .leak = 1) {
+    malloc(64);     // leaks OK, check suppressed
+}
+
+it("heap-free code path", .no_alloc = 1) {
+    int x = 1 + 1;  // assert no heap allocation
+}
+```
+
+`.leak = 0` (the default) asserts no net memory leak after the test. Supported on Linux, macOS (via `dlsym` interception), and MSVC debug builds.
 
 ```c
 typedef struct { int a, b, sum; } triple;
@@ -92,41 +157,29 @@ it("add", generate(triple, add_cases, 5)) {
 
 ```c
 it("no memory leak") {
-    expect_no_leak({
-        void *p = malloc(64);
-        free(p);        // ok — net zero
-    });
+    void *p = malloc(64);
+    free(p);
 }
 
-it("no heap allocation") {
-    expect_no_alloc({
-        int x = 1 + 1;  // stack only
-    });
+it("heap-free code path", .no_alloc = 1) {
+    int x = 1 + 1;
+    (void)x;
 }
 
-it("no buffer overrun") {
-    unsigned char buf[32];
-    expect_no_overflow(buf, {
-        arr[0] = 0xff;  // arr is the guarded alias for buf
-    });
+it("guarded buffer", .buf = 32) {
+    ct_buf[0] = 0xff;  /* ct_buf is a 32-byte canary-guarded region */
 }
 ```
 
-`expect_no_leak` / `expect_no_alloc` work on Linux and macOS (via `dlsym` interception). `expect_no_overflow` uses canary bytes on all platforms.
-
-
+`.buf = N` allocates an N-byte zero-initialized, canary-bracketed buffer before the body and exposes it as `ct_buf`. Overruns and underruns are reported as failures after the body returns.
 
 ```c
-it("aborts on bad input") {
-    expect_abort({ process(NULL); });
-}
-
-it("segfaults on null deref") {
-    expect_signal(SIGSEGV, { *(int *)0 = 1; });
+it("captures stdout") {
+    ct_capture_stdout();
+    printf("hello capture");
+    expect(strcmp(ct_captured(), "hello capture") == 0);
 }
 ```
-
-On POSIX: uses `fork()` for full isolation. On Windows (MSVC): uses SEH (`__try`/`__except`) — `abort()` is bridged via a SIGABRT handler that raises a catchable Win32 exception. MinGW has no implementation (no-op).
 
 ## CLI
 
@@ -159,5 +212,5 @@ it("std::string") {
 g++ -std=c++11 mytest.cpp -I. -DCTEST -o mytest
 ```
 
-MSVC requires `/std:c++20` (for designated initializers). Field order in `it()` must match declaration order: `skip`, `platforms`, `std`, `known`, `timeout`, `tags`.
+MSVC requires `/std:c++20` (for designated initializers). Field order in `it()` must match declaration order: `skip`, `leak`, `no_alloc`, `abort`, `signal`, `data`, `setup`, `teardown`, `platforms`, `std`, `known`, `timeout`, `tags`, `depends_on`, `retry`, `env`.
 

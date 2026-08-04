@@ -47,6 +47,7 @@
 #define CT_MAX_TAGS      16
 #define CT_MAX_PLATFORMS  8
 #define CT_MAX_FAILURES   8
+#define CT_MAX_ENV        8
 
 #define CT_JOIN(a, b) CT_JOIN_(a, b)
 #define CT_JOIN_(a, b) a##b
@@ -231,16 +232,6 @@
 #define CT_PARAM_CALL(...) CT_PARAM_CALL_II(CT_HAS_CASES(__VA_ARGS__), __VA_ARGS__)
 #define CT_PARAM_CALL_II(c, ...) CT_CAT(CT_PARAM_CALL_, c)(__VA_ARGS__)
 
-typedef struct it_t {
-    const char *name;
-    int skip;
-    const char *platforms[CT_MAX_PLATFORMS];
-    const char *std;
-    const char *known;
-    int timeout;
-    const char *tags[CT_MAX_TAGS];
-} it_t;
-
 typedef struct ctest_failure {
     const char *file;
     int line;
@@ -251,6 +242,33 @@ typedef struct ctest_failure {
 } ctest_failure;
 
 typedef enum ctest_status { CT_PASS, CT_FAIL, CT_SKIP, CT_CRASH, CT_TIMEOUT } ctest_status;
+
+/* key/value pair for .env; a NULL key terminates the list; NULL value unsets */
+typedef struct { const char *key; const char *value; } ct_env;
+
+/* forward declaration so function pointers inside it_t can reference it */
+typedef struct it_t it_t;
+struct it_t {
+    const char *name;
+    int skip;
+    int leak;    /* 0 = assert no leak (default), 1 = leaks OK */
+    int no_alloc; /* 0 = alloc allowed (default), 1 = assert no allocation */
+    int abort;   /* 0 = not expected, 1 = expected */
+    int signal;  /* 0 = none, N = expect signal number N */
+    void *data;  /* arbitrary user context; passed through to all hooks via it->data */
+    int buf;     /* 0 = no buffer; N = allocate N-byte canary-guarded buffer, exposed as ct_buf */
+    int retry;   /* retry this test up to N times on failure before marking it failed */
+    ct_env env[CT_MAX_ENV]; /* env vars to set before the body; restored after */
+    void (*setup)(const it_t *it);    /* called before the test body; it->result is CT_PASS (unset) */
+    void (*teardown)(const it_t *it); /* called after the test body; it->result is populated */
+    const char *platforms[CT_MAX_PLATFORMS];
+    const char *std;
+    const char *known;
+    int timeout;
+    const char *tags[CT_MAX_TAGS];
+    const char *depends_on; /* if set: skip this test if the named test failed in this run */
+    ctest_status result; /* set before teardown/after_each; CT_PASS (0) when called from setup/before_each */
+};
 
 typedef struct ctest_result {
     const char *name;
@@ -360,6 +378,7 @@ int main(int argc, char **argv) {
 #include <time.h>
 #ifdef _WIN32
 #  include <windows.h>
+#  include <fcntl.h>   /* O_BINARY */
 #  include <io.h>      /* _isatty, _fileno */
 #else
 #  include <sys/time.h>
@@ -376,43 +395,49 @@ int main(int argc, char **argv) {
  * Optional lifecycle hooks. Define any (or all) of these in your test file
  * to run code around the suite:
  *
- *     void ctest_setup(void)        once before all tests (per process)
- *     void ctest_teardown(void)     once after all tests (per process)
- *     void ctest_before_each(void)  before each test
- *     void ctest_after_each(void)   after each test
+ *     void ctest_setup(void)                    once before all tests (per process)
+ *     void ctest_teardown(void)                 once after all tests (per process)
+ *     void ctest_before_each(const it_t *it)    before each test
+ *     void ctest_after_each(const it_t *it)     after each test
  *
  * Because every test runs in its own child process under the c-test runner,
  * setup/teardown run once per child there; in standalone mode they run once
  * per suite.
  *
  * Each hook defaults to a no-op. To run your own, map the hook to a function
- * with a `#define` before including this header and declare that function:
+ * with a `#define` before including this header:
  *
  *     #define ctest_before_each my_before_each
- *     void my_before_each(void);
  *     #include "ctest.h"
  *
- *     void my_before_each(void) { ... }
+ *     void my_before_each(const it_t *it) { ... }
+ *
+ * ctest.h emits the extern declaration automatically — no forward declaration
+ * needed. setup/teardown follow the same pattern but take no arguments.
  *
  * Plain C99, no weak symbols: works on GCC, Clang, and TCC.
  */
 #ifndef ctest_setup
 #define ctest_setup ct_noop_setup
+static void CT_UNUSED ct_noop_setup(void) {}
 #endif
 #ifndef ctest_teardown
 #define ctest_teardown ct_noop_teardown
+static void CT_UNUSED ct_noop_teardown(void) {}
 #endif
 #ifndef ctest_before_each
 #define ctest_before_each ct_noop_before_each
+static void CT_UNUSED ct_noop_before_each(const it_t *it) { (void)it; }
+#else
+/* emit the extern so the user doesn't need a forward declaration */
+extern void ctest_before_each(const it_t *it);
 #endif
 #ifndef ctest_after_each
 #define ctest_after_each ct_noop_after_each
+static void CT_UNUSED ct_noop_after_each(const it_t *it) { (void)it; }
+#else
+extern void ctest_after_each(const it_t *it);
 #endif
-
-static void CT_UNUSED ct_noop_setup(void) {}
-static void CT_UNUSED ct_noop_teardown(void) {}
-static void CT_UNUSED ct_noop_before_each(void) {}
-static void CT_UNUSED ct_noop_after_each(void) {}
 
 #if defined(__linux__)
 #include <sys/prctl.h>
@@ -651,6 +676,33 @@ static int g_fail_count;
 static int g_cur_case = -1;
 static const char *g_cur_case_desc;
 
+static char **ct_dep_failed;
+static int ct_dep_failed_n;
+
+static int ct_dep_has_failed(const char *name) {
+    if (!name) return 0;
+    for (int i = 0; i < ct_dep_failed_n; i++)
+        if (strcmp(ct_dep_failed[i], name) == 0) return 1;
+    return 0;
+}
+
+static void ct_dep_note_failed(const char *name) {
+    char **next;
+    if (!name || ct_dep_has_failed(name)) return;
+    next = (char **)realloc(ct_dep_failed,
+                            (size_t)(ct_dep_failed_n + 1) * sizeof *ct_dep_failed);
+    if (!next) return;
+    ct_dep_failed = next;
+    ct_dep_failed[ct_dep_failed_n++] = strdup(name);
+}
+
+static void ct_dep_clear_failed(void) {
+    for (int i = 0; i < ct_dep_failed_n; i++) free(ct_dep_failed[i]);
+    free(ct_dep_failed);
+    ct_dep_failed = NULL;
+    ct_dep_failed_n = 0;
+}
+
 void ctest_expect(int ok, const char *file, int line, const char *expr,
                   const char *msg) {
     if (ok) return;
@@ -688,37 +740,14 @@ static const char *ct_signal_explain(int sig, int st) {
     return buf;
 }
 
-#define expect_signal(sig, ...) do {                                       \
-    pid_t ct_pid = fork();                                                 \
-    if (ct_pid < 0) {                                                      \
-        expect(0, "fork() failed");                                        \
-        break;                                                             \
-    }                                                                      \
-    if (ct_pid == 0) {                                                     \
-        ct_timeout_stop();                                                 \
-        __VA_ARGS__                                                        \
-        _exit(0);                                                          \
-    }                                                                      \
-    int ct_st = 0;                                                         \
-    waitpid(ct_pid, &ct_st, 0);                                            \
-    expect(WIFSIGNALED(ct_st) && WTERMSIG(ct_st) == (sig),                 \
-           ct_signal_explain((sig), ct_st));                               \
-} while (0)
-
-#define expect_abort(...) expect_signal(SIGABRT, __VA_ARGS__)
+#define CT_HAS_CRASH_DETECT 1
 
 #elif defined(_MSC_VER)
 /*
- * Windows / MSVC: no fork(), but we have SEH (__try/__except).
- *
- * Hardware faults (SIGSEGV, SIGFPE, SIGILL) map directly to Win32 exception
- * codes that __except can catch.
- *
- * abort() raises SIGABRT (a C signal, not a Win32 exception), so we install a
- * SIGABRT handler that converts it to a custom Win32 exception code, then
- * catch that with __except too — keeping the implementation uniform.
+ * Windows / MSVC: hardware faults map to Win32 exceptions; abort() is
+ * bridged via a SIGABRT → RaiseException shim.
  */
-#define CT_ABORT_EXCEPTION 0xE0435400UL  /* user-defined; high bits = error */
+#define CT_ABORT_EXCEPTION 0xE0435400UL
 
 static void ct_abort_to_seh(int s) {
     (void)s;
@@ -738,25 +767,8 @@ static int ct_seh_filter(unsigned int code, int sig) {
     return (code == want) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
 }
 
-#define expect_signal(sig, ...) do {                                             \
-    void (*_ct_ha)(int) = (void(*)(int))NULL;                                    \
-    if ((sig) == SIGABRT) _ct_ha = signal(SIGABRT, ct_abort_to_seh);           \
-    volatile int _ct_ok = 0;                                                     \
-    __try { __VA_ARGS__; }                                                       \
-    __except (ct_seh_filter((unsigned int)GetExceptionCode(), (sig))) {         \
-        _ct_ok = 1;                                                              \
-    }                                                                            \
-    if (_ct_ha) signal(SIGABRT, _ct_ha);                                         \
-    ctest_expect((int)_ct_ok, __FILE__, __LINE__,                               \
-        "expect_signal(" #sig ")", "expected signal was not raised");           \
-} while (0)
-
-#define expect_abort(...) expect_signal(SIGABRT, __VA_ARGS__)
-
-#else  /* _WIN32 but not _MSC_VER (e.g. MinGW): no SEH */
-#define expect_signal(sig, ...) ((void)(sig))
-#define expect_abort(...)       ((void)0)
-#endif
+#define CT_HAS_CRASH_DETECT 1
+#endif /* crash detection helpers */
 
 /* ── expect_no_leak ────────────────────────────────────────────────────────
  * Asserts that no heap memory is net-allocated inside the block.
@@ -856,91 +868,212 @@ void *realloc(void *old, size_t n) {
     return p;
 }
 
-#  define expect_no_leak(block)                                               \
-    do {                                                                        \
-        long _ct_before = ct_alloc_live;                                        \
-        do block while (0);                                                     \
-        long _ct_after = ct_alloc_live;                                         \
-        if (_ct_after > _ct_before)                                             \
-            ctest_expect(0, __FILE__, __LINE__,                                 \
-                "expect_no_leak",                                               \
-                "heap grew after block (possible leak)");                       \
-    } while (0)
-#  define expect_no_alloc(block)                                              \
-    do {                                                                        \
-        long _ct_calls = ct_alloc_calls;                                        \
-        do block while (0);                                                     \
-        if (ct_alloc_calls > _ct_calls)                                         \
-            ctest_expect(0, __FILE__, __LINE__,                                 \
-                "expect_no_alloc",                                              \
-                "unexpected heap allocation in block");                         \
-    } while (0)
+#  define CT_HAS_HEAP_TRACK 1
 
 #elif defined(_MSC_VER) && defined(_DEBUG) && defined(CTEST)
-#  define expect_no_leak(block)                                               \
-    do {                                                                        \
-        _CrtMemState _ct_s1, _ct_s2, _ct_diff;                                 \
-        _CrtMemCheckpoint(&_ct_s1);                                             \
-        do block while (0);                                                     \
-        _CrtMemCheckpoint(&_ct_s2);                                             \
-        if (_CrtMemDifference(&_ct_diff, &_ct_s1, &_ct_s2))                    \
-            ctest_expect(0, __FILE__, __LINE__,                                 \
-                "expect_no_leak",                                               \
-                "heap grew after block (possible leak)");                       \
-    } while (0)
-#  define expect_no_alloc(block) do block while (0)  /* no alloc hook on MSVC */
+#  define CT_HAS_HEAP_TRACK 1
 
-#else
-/* No heap introspection available: block runs but checks are skipped. */
-#  define expect_no_leak(block)  do block while (0)
-#  define expect_no_alloc(block) do block while (0)
-#endif
+#endif /* heap tracking */
 
-/* expect_no_overflow(src, block)
- * Detects buffer under/overruns by surrounding a copy of `src` with canary
- * bytes. Inside the block the wrapped buffer is always available as `arr`
- * (an unsigned char *). After the block the canaries are verified and data
- * is copied back to the original array.
- *
- * `src` must be a fixed-size array (sizeof(src) must be a constant).
- *
- * Usage:
- *   char buf[32];
- *   expect_no_overflow(buf, {
- *       some_write_fn(arr, input);   // arr = canary-wrapped copy of buf
- *   });
- */
 #define CT_CANARY_N  16
 #define CT_CANARY_B  ((unsigned char)0xAB)
 
-#define expect_no_overflow(src, block)                                          \
-    do {                                                                        \
-        enum { _ct_ofl_n = (int)(sizeof(src)) };                               \
-        unsigned char _ct_ofl_buf[(size_t)(CT_CANARY_N + _ct_ofl_n + CT_CANARY_N)]; \
-        unsigned char *_ct_ofl_data = _ct_ofl_buf + CT_CANARY_N;              \
-        memset(_ct_ofl_buf, CT_CANARY_B, CT_CANARY_N);                        \
-        memset(_ct_ofl_data, 0, (size_t)_ct_ofl_n);                          \
-        memset(_ct_ofl_data + (size_t)_ct_ofl_n, CT_CANARY_B, CT_CANARY_N);  \
-        {                                                                       \
-            unsigned char *arr = _ct_ofl_data;                                  \
-            do block while (0);                                                 \
-        }                                                                       \
-        int _ct_ofl_under = 0, _ct_ofl_over = 0;                               \
-        for (int _ct_i = 0; _ct_i < CT_CANARY_N; _ct_i++) {                   \
-            if (_ct_ofl_buf[_ct_i] != CT_CANARY_B) { _ct_ofl_under = 1; break; } \
-        }                                                                       \
-        for (int _ct_i = 0; _ct_i < CT_CANARY_N; _ct_i++) {                   \
-            if (_ct_ofl_data[(size_t)_ct_ofl_n + _ct_i] != CT_CANARY_B) {     \
-                _ct_ofl_over = 1; break;                                        \
-            }                                                                   \
-        }                                                                       \
-        if (_ct_ofl_under)                                                      \
-            ctest_expect(0, __FILE__, __LINE__, "expect_no_overflow",           \
-                         "buffer underrun: write before start of array");       \
-        if (_ct_ofl_over)                                                       \
-            ctest_expect(0, __FILE__, __LINE__, "expect_no_overflow",           \
-                         "buffer overrun: write past end of array");            \
-    } while (0)
+/*
+ * ct_buf — framework-managed canary-guarded buffer for .buf = N tests.
+ * Set to a valid N-byte region before the test body, NULL otherwise.
+ * Canary bytes bracket it; overruns and underruns are detected after fn().
+ */
+static unsigned char *ct_buf = NULL;
+static unsigned char *ct_buf_guard = NULL;  /* full allocation including canaries */
+static size_t         ct_buf_size  = 0;
+
+static void ct_buf_setup(int n) {
+    if (n <= 0) return;
+    unsigned char *g = (unsigned char *)malloc(CT_CANARY_N + (size_t)n + CT_CANARY_N);
+    if (!g) return;
+    memset(g,                          CT_CANARY_B, CT_CANARY_N);
+    memset(g + CT_CANARY_N,            0,           (size_t)n);
+    memset(g + CT_CANARY_N + (size_t)n, CT_CANARY_B, CT_CANARY_N);
+    ct_buf_guard = g;
+    ct_buf       = g + CT_CANARY_N;
+    ct_buf_size  = (size_t)n;
+}
+
+static void ct_buf_check(const ctest_test *t) {
+    if (!ct_buf_guard) return;
+    int under = 0, over = 0;
+    for (int i = 0; i < CT_CANARY_N; i++)
+        if (ct_buf_guard[i] != CT_CANARY_B) { under = 1; break; }
+    for (int i = 0; i < CT_CANARY_N; i++)
+        if (ct_buf_guard[CT_CANARY_N + ct_buf_size + (size_t)i] != CT_CANARY_B)
+            { over = 1; break; }
+    if (under)
+        ctest_expect(0, t->file, t->line, ".buf",
+                     "buffer underrun: write before start of .buf");
+    if (over)
+        ctest_expect(0, t->file, t->line, ".buf",
+                     "buffer overrun: write past end of .buf");
+    free(ct_buf_guard);
+    ct_buf_guard = NULL;
+    ct_buf       = NULL;
+    ct_buf_size  = 0;
+}
+
+static void ct_buf_free(void) {
+    free(ct_buf_guard);
+    ct_buf_guard = NULL;
+    ct_buf       = NULL;
+    ct_buf_size  = 0;
+}
+
+/* ── .env: save/restore environment variables around a test body ──────── */
+static char *ct_env_saved[CT_MAX_ENV];
+static int   ct_env_n_saved;
+
+static void ct_env_push(const ct_env *env) {
+    ct_env_n_saved = 0;
+    for (int i = 0; i < CT_MAX_ENV && env[i].key; i++) {
+        const char *old = getenv(env[i].key);
+        ct_env_saved[i] = old ? strdup(old) : NULL;
+        ct_env_n_saved++;
+#ifndef _WIN32
+        if (env[i].value) setenv(env[i].key, env[i].value, 1);
+        else              unsetenv(env[i].key);
+#else
+        _putenv_s(env[i].key, env[i].value ? env[i].value : "");
+#endif
+    }
+}
+
+static void ct_env_pop(const ct_env *env) {
+    for (int i = ct_env_n_saved - 1; i >= 0; i--) {
+#ifndef _WIN32
+        if (ct_env_saved[i]) setenv(env[i].key, ct_env_saved[i], 1);
+        else                  unsetenv(env[i].key);
+#else
+        _putenv_s(env[i].key, ct_env_saved[i] ? ct_env_saved[i] : "");
+#endif
+        free(ct_env_saved[i]);
+        ct_env_saved[i] = NULL;
+    }
+    ct_env_n_saved = 0;
+}
+
+#ifdef _WIN32
+static int ct_cap_saved_fd = -1;
+static int ct_cap_pipe_fds[2] = { -1, -1 };
+static char ct_cap_buf[65536];
+
+static void ct_capture_stdout(void) CT_UNUSED;
+static void ct_capture_stdout(void) {
+    if (ct_cap_saved_fd >= 0) return;
+    if (_pipe(ct_cap_pipe_fds, (unsigned)sizeof ct_cap_buf, O_BINARY) != 0) return;
+    ct_cap_saved_fd = _dup(_fileno(stdout));
+    if (ct_cap_saved_fd < 0) {
+        _close(ct_cap_pipe_fds[0]);
+        _close(ct_cap_pipe_fds[1]);
+        ct_cap_pipe_fds[0] = ct_cap_pipe_fds[1] = -1;
+        return;
+    }
+    fflush(stdout);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (_dup2(ct_cap_pipe_fds[1], _fileno(stdout)) != 0) {
+        _close(ct_cap_saved_fd);
+        ct_cap_saved_fd = -1;
+        _close(ct_cap_pipe_fds[0]);
+        _close(ct_cap_pipe_fds[1]);
+        ct_cap_pipe_fds[0] = ct_cap_pipe_fds[1] = -1;
+        return;
+    }
+    _close(ct_cap_pipe_fds[1]);
+    ct_cap_pipe_fds[1] = -1;
+}
+
+static const char *ct_captured(void) CT_UNUSED;
+static const char *ct_captured(void) {
+    int n;
+    if (ct_cap_saved_fd < 0) return "";
+    fflush(stdout);
+    _dup2(ct_cap_saved_fd, _fileno(stdout));
+    _close(ct_cap_saved_fd);
+    ct_cap_saved_fd = -1;
+    n = _read(ct_cap_pipe_fds[0], ct_cap_buf, (unsigned)sizeof(ct_cap_buf) - 1);
+    if (n < 0) n = 0;
+    ct_cap_buf[n] = '\0';
+    _close(ct_cap_pipe_fds[0]);
+    ct_cap_pipe_fds[0] = -1;
+    return ct_cap_buf;
+}
+#else
+static int ct_cap_saved_fd = -1;
+static int ct_cap_pipe_fds[2] = { -1, -1 };
+static char ct_cap_buf[65536];
+
+static void ct_capture_stdout(void) CT_UNUSED;
+static void ct_capture_stdout(void) {
+    if (ct_cap_saved_fd >= 0) return;
+    if (pipe(ct_cap_pipe_fds) != 0) return;
+    ct_cap_saved_fd = dup(STDOUT_FILENO);
+    if (ct_cap_saved_fd < 0) {
+        close(ct_cap_pipe_fds[0]);
+        close(ct_cap_pipe_fds[1]);
+        ct_cap_pipe_fds[0] = ct_cap_pipe_fds[1] = -1;
+        return;
+    }
+    fflush(stdout);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (dup2(ct_cap_pipe_fds[1], STDOUT_FILENO) < 0) {
+        close(ct_cap_saved_fd);
+        ct_cap_saved_fd = -1;
+        close(ct_cap_pipe_fds[0]);
+        close(ct_cap_pipe_fds[1]);
+        ct_cap_pipe_fds[0] = ct_cap_pipe_fds[1] = -1;
+        return;
+    }
+    close(ct_cap_pipe_fds[1]);
+    ct_cap_pipe_fds[1] = -1;
+}
+
+static const char *ct_captured(void) CT_UNUSED;
+static const char *ct_captured(void) {
+    ssize_t n;
+    if (ct_cap_saved_fd < 0) return "";
+    fflush(stdout);
+    dup2(ct_cap_saved_fd, STDOUT_FILENO);
+    close(ct_cap_saved_fd);
+    ct_cap_saved_fd = -1;
+    n = read(ct_cap_pipe_fds[0], ct_cap_buf, sizeof(ct_cap_buf) - 1);
+    if (n < 0) n = 0;
+    ct_cap_buf[n] = '\0';
+    close(ct_cap_pipe_fds[0]);
+    ct_cap_pipe_fds[0] = -1;
+    return ct_cap_buf;
+}
+#endif
+
+static void ct_restore_stdout_if_capturing(void) {
+#ifdef _WIN32
+    if (ct_cap_saved_fd >= 0) {
+        _dup2(ct_cap_saved_fd, _fileno(stdout));
+        _close(ct_cap_saved_fd);
+        ct_cap_saved_fd = -1;
+        if (ct_cap_pipe_fds[0] >= 0) {
+            _close(ct_cap_pipe_fds[0]);
+            ct_cap_pipe_fds[0] = -1;
+        }
+    }
+#else
+    if (ct_cap_saved_fd >= 0) {
+        dup2(ct_cap_saved_fd, STDOUT_FILENO);
+        close(ct_cap_saved_fd);
+        ct_cap_saved_fd = -1;
+        if (ct_cap_pipe_fds[0] >= 0) {
+            close(ct_cap_pipe_fds[0]);
+            ct_cap_pipe_fds[0] = -1;
+        }
+    }
+#endif
+}
 
 static int ct_stristr(const char *hay, const char *needle) {
     size_t nh = strlen(hay), nn = strlen(needle);
@@ -1077,6 +1210,10 @@ static char g_reason[128];
 
 static const char *ct_skip_reason(const ctest_test *t) {
     if (t->spec.skip) return "skipped";
+#ifndef CT_HAS_CRASH_DETECT
+    if (t->spec.abort || t->spec.signal)
+        return "crash detection not supported on this platform";
+#endif
     if (!ct_platform_ok(t->spec.platforms)) {
         int n = 0;
         char *p = g_reason;
@@ -1092,6 +1229,10 @@ static const char *ct_skip_reason(const ctest_test *t) {
     }
     if (!ct_std_ok(t->spec.std)) {
         snprintf(g_reason, sizeof g_reason, "requires %s", t->spec.std);
+        return g_reason;
+    }
+    if (t->spec.depends_on && ct_dep_has_failed(t->spec.depends_on)) {
+        snprintf(g_reason, sizeof g_reason, "dependency '%s' failed", t->spec.depends_on);
         return g_reason;
     }
     return NULL;
@@ -1490,6 +1631,17 @@ static void ct_usage(FILE *out) {
         "  per-test traits (in it(...), Swift-testing style)\n"
         "    .tags = { \"math\", \"fast\" }  tag the test\n"
         "    .skip = 1              always skip\n"
+        "    .abort = 1             assert the test calls abort()\n"
+        "    .signal = SIGSEGV      assert the test raises that signal\n"
+        "    .leak = 1              leaks are OK (default: assert no leak)\n"
+        "    .no_alloc = 1          assert no heap allocation\n"
+        "    .buf = <n>             allocate n-byte canary-guarded buffer; access as ct_buf\n"
+        "    .depends_on = \"name\"   skip if the named test failed\n"
+        "    .retry = N             retry up to N times on failure before marking failed\n"
+        "    .env = {{\"K\",\"V\"},{0}}  set env vars for the test body; NULL value unsets\n"
+        "    .setup = fn            called before the body (receives it_t *)\n"
+        "    .teardown = fn         called after the body (it->result is populated)\n"
+        "    .data = ptr            arbitrary context passed to all hooks via it->data\n"
         "    .platforms = {\"linux\"}              only run on listed platforms\n"
         "    .platforms = {\"linux\",\"windows\"}   run on any of the listed platforms\n"
         "    .known = \"JIRA-123\"    expected failure; counts as known, not failed\n"
@@ -1575,7 +1727,9 @@ static int ct_list(const ct_opts *o) {
     ct_build_sel(o, &sel, &nsel);
     for (size_t i = 0; i < nsel; i++) {
         const ctest_test *t = g_tests[sel[i]];
-        printf("%s\t%s\t%d\t%d\n", t->spec.name, t->file, t->line, t->spec.timeout);
+        printf("%s\t%s\t%d\t%d\t%s\t%d\n", t->spec.name, t->file, t->line, t->spec.timeout,
+               t->spec.depends_on ? t->spec.depends_on : "",
+               t->spec.retry);
     }
     free(sel);
     return 0;
@@ -1622,6 +1776,135 @@ static void ct_case_descs_clear(void) {
  * Returns nonzero if any case timed out. Callers must free case descriptions
  * with ct_case_descs_clear() after reporting.
  */
+/*
+ * ct_run_once — invoke t->fn() once (case context already set in globals).
+ * Enforces .abort/.signal crash expectations and .leak/.no_alloc heap checks.
+ * Returns 1 if the invocation timed out, 0 otherwise.
+ */
+static int ct_run_once(const ctest_test *t) {
+    int crash_expected = t->spec.abort || t->spec.signal;
+
+#if !defined(_WIN32)  /* POSIX: fork + waitpid */
+    if (crash_expected) {
+        int expected = t->spec.abort ? SIGABRT : t->spec.signal;
+        pid_t pid = fork();
+        if (pid < 0) {
+            ctest_expect(0, t->file, t->line,
+                t->spec.abort ? ".abort" : ".signal", "fork() failed");
+            return 0;
+        }
+        if (pid == 0) {
+            signal(SIGALRM, SIG_DFL);
+            close(STDOUT_FILENO); close(STDERR_FILENO);
+            if (t->spec.timeout > 0)
+                alarm((unsigned)((t->spec.timeout + 999) / 1000));
+            ct_buf_setup(t->spec.buf);
+            t->fn();
+            ct_restore_stdout_if_capturing();
+            ct_buf_check(t);
+            _exit(0);
+        }
+        int st = 0;
+        waitpid(pid, &st, 0);
+        if (!(WIFSIGNALED(st) && WTERMSIG(st) == expected))
+            ctest_expect(0, t->file, t->line,
+                t->spec.abort ? ".abort" : ".signal",
+                ct_signal_explain(expected, st));
+        return 0;
+    }
+#elif defined(_MSC_VER)  /* MSVC: SEH */
+    if (crash_expected) {
+        int expected = t->spec.abort ? SIGABRT : t->spec.signal;
+        void (*prev)(int) = NULL;
+        volatile int caught = 0;
+        volatile int completed = 0;
+        if (expected == SIGABRT) prev = signal(SIGABRT, ct_abort_to_seh);
+        ct_buf_setup(t->spec.buf);
+        __try {
+            t->fn();
+            completed = 1;
+        }
+        __except (ct_seh_filter((unsigned int)GetExceptionCode(), expected)) {
+            caught = 1;
+        }
+        if (prev) signal(SIGABRT, prev);
+        if (completed) {
+            ct_restore_stdout_if_capturing();
+            ct_buf_check(t);
+        } else {
+            ct_restore_stdout_if_capturing();
+            ct_buf_free();
+        }
+        if (!caught)
+            ctest_expect(0, t->file, t->line,
+                t->spec.abort ? ".abort" : ".signal",
+                "expected abort/signal did not occur");
+        return 0;
+    }
+#endif
+
+    /* Normal path: optional heap checks + timeout. */
+    int timed_out = 0;
+
+#if defined(CT_HAS_HEAP_TRACK) && (defined(__linux__) || defined(__APPLE__))
+    long pre_live  = !t->spec.leak  ? ct_alloc_live  : 0;
+    long pre_calls =  t->spec.no_alloc ? ct_alloc_calls : 0;
+#elif defined(CT_HAS_HEAP_TRACK) && defined(_MSC_VER)
+    _CrtMemState _ct_s1;
+    if (!t->spec.leak) _CrtMemCheckpoint(&_ct_s1);
+#endif
+
+    ct_buf_setup(t->spec.buf);
+#ifdef _WIN32
+    ct_timeout_start(t->spec.timeout);
+    t->fn();
+    ct_timeout_stop();
+    ct_restore_stdout_if_capturing();
+    ct_buf_check(t);
+#else
+    if (sigsetjmp(ct_alarm_jb, 1) == 0) {
+        ct_timeout_start(t->spec.timeout);
+        t->fn();
+        ct_timeout_stop();
+        ct_restore_stdout_if_capturing();
+        ct_buf_check(t);
+    } else {
+        ct_timeout_stop();
+        timed_out = 1;
+        ct_restore_stdout_if_capturing();
+        ct_buf_free();
+        if (g_fail_count < CT_MAX_FAILURES) {
+            ctest_failure *f = &g_failures[g_fail_count];
+            f->file = t->file;
+            f->line = t->line;
+            f->expr = "timed out (per-test .timeout)";
+            f->msg  = NULL;
+            f->case_index = g_cur_case;
+            f->case_desc  = g_cur_case_desc;
+        }
+        g_fail_count++;
+    }
+#endif
+
+    if (!timed_out) {
+#if defined(CT_HAS_HEAP_TRACK) && (defined(__linux__) || defined(__APPLE__))
+        if (!t->spec.leak && ct_alloc_live > pre_live)
+            ctest_expect(0, t->file, t->line, ".leak", "memory leaked");
+        if (t->spec.no_alloc && ct_alloc_calls > pre_calls)
+            ctest_expect(0, t->file, t->line, ".no_alloc",
+                         "unexpected heap allocation");
+#elif defined(CT_HAS_HEAP_TRACK) && defined(_MSC_VER)
+        if (!t->spec.leak) {
+            _CrtMemState _ct_s2, _ct_diff;
+            _CrtMemCheckpoint(&_ct_s2);
+            if (_CrtMemDifference(&_ct_diff, &_ct_s1, &_ct_s2))
+                ctest_expect(0, t->file, t->line, ".leak", "memory leaked");
+        }
+#endif
+    }
+    return timed_out;
+}
+
 static int ct_run_body(const ctest_test *t, size_t from, size_t to,
                        void (*emit_case)(size_t, const char *)) {
     ct_case_descs_clear();
@@ -1634,36 +1917,11 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
         g_cur_case = -1;
         g_cur_case_desc = NULL;
         g_case_ptr = NULL;
-#ifdef _WIN32
-        ct_timeout_start(t->spec.timeout);
-        t->fn();
-        ct_timeout_stop();
-#else
-        if (sigsetjmp(ct_alarm_jb, 1) == 0) {
-            ct_timeout_start(t->spec.timeout);
-            t->fn();
-            ct_timeout_stop();
-        } else {
-            ct_timeout_stop();
-            timed_out = 1;
-            if (g_fail_count < CT_MAX_FAILURES) {
-                ctest_failure *f = &g_failures[g_fail_count];
-                f->file = t->file;
-                f->line = t->line;
-                f->expr = "timed out (per-test .timeout)";
-                f->msg = NULL;
-                f->case_index = -1;
-                f->case_desc = NULL;
-            }
-            g_fail_count++;
-        }
-#endif
-        return timed_out;
+        return ct_run_once(t);
     }
     if (to > count) to = count;
     if (from > to) from = to;
 
-    /* For generate() tests, allocate a reusable buffer for one generated value. */
     void *gen_buf = NULL;
     if (is_gen && t->cases_elem > 0) {
         gen_buf = malloc(t->cases_elem);
@@ -1673,11 +1931,9 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
     g_case_desc_n = to - from;
     g_case_descs = g_case_desc_n ? (char **)malloc(g_case_desc_n * sizeof *g_case_descs) : NULL;
 
-    /* Build case descriptions (requires the generated value for generate tests). */
     for (size_t j = from; j < to; j++) {
         const char *elem_ptr;
         if (is_gen) {
-            /* Seed per-case so order doesn't matter and runs are reproducible. */
             srand(g_seed ^ (unsigned)(j * 2654435761u));
             t->cases_gen(gen_buf);
             elem_ptr = (const char *)gen_buf;
@@ -1689,33 +1945,9 @@ static int ct_run_body(const ctest_test *t, size_t from, size_t to,
         g_cur_case = (int)j;
         g_cur_case_desc = g_case_descs[j - from];
         g_case_ptr = elem_ptr;
-        int to2 = 0;
-#ifdef _WIN32
-        ct_timeout_start(t->spec.timeout);
-        t->fn();
-        ct_timeout_stop();
-#else
-        if (sigsetjmp(ct_alarm_jb, 1) == 0) {
-            ct_timeout_start(t->spec.timeout);
-            t->fn();
-            ct_timeout_stop();
-        } else {
-            ct_timeout_stop();
-            to2 = 1;
-        }
-#endif
-        if (to2) {
+        if (ct_run_once(t)) {
             timed_out = 1;
-            if (g_fail_count < CT_MAX_FAILURES) {
-                ctest_failure *f = &g_failures[g_fail_count];
-                f->file = t->file;
-                f->line = t->line;
-                f->expr = "timed out (per-test .timeout)";
-                f->msg = NULL;
-                f->case_index = (int)j;
-                f->case_desc = g_case_descs[j - from];
-            }
-            g_fail_count++;
+            /* timeout failure already recorded by ct_run_once */
         }
     }
     if (gen_buf) free(gen_buf);
@@ -1781,13 +2013,21 @@ static int ct_run_one(const char *name) {
         }
         g_fail_count = 0;
         ctest_setup();
-        ctest_before_each();
+        ctest_before_each(&t->spec);
+        if (t->spec.setup) t->spec.setup(&t->spec);
+        ct_env_push(t->spec.env);
         int timed_out = ct_run_body(t, only >= 0 ? (size_t)only : 0,
                                     only >= 0 ? (size_t)only + 1
                                               : (t->cases_gen ? t->cases_gen_count
                                                               : t->cases_count),
                                     ct_emit_running);
-        ctest_after_each();
+        ct_env_pop(t->spec.env);
+        {
+            it_t after_spec = t->spec;
+            after_spec.result = timed_out ? CT_TIMEOUT : (g_fail_count > 0 ? CT_FAIL : CT_PASS);
+            if (t->spec.teardown) t->spec.teardown(&after_spec);
+            ctest_after_each(&after_spec);
+        }
         ctest_teardown();
         double secs = ct_now() - t0;
         if (timed_out) {
@@ -1818,6 +2058,7 @@ done:
 
 static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel) {
     const ctest_reporter *R = o->quiet ? &ct_quiet : o->tap ? &ct_tap : o->reporter;
+    ct_dep_clear_failed();
     g_name_width = 0;
     for (size_t i = 0; i < nsel; i++) {
         size_t l = strlen(g_tests[sel[i]]->spec.name);
@@ -1849,10 +2090,27 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel) {
         }
         g_fail_count = 0;
         double t0 = ct_now();
-        ctest_before_each();
+        ctest_before_each(&t->spec);
+        if (t->spec.setup) t->spec.setup(&t->spec);
+        ct_env_push(t->spec.env);
         int timed_out = ct_run_body(t, 0, t->cases_gen ? t->cases_gen_count
                                                         : t->cases_count, NULL);
-        ctest_after_each();        res.seconds = ct_now() - t0;
+        int retries_left = t->spec.retry;
+        int flaky = 0;
+        while (retries_left > 0 && (timed_out || g_fail_count > 0)) {
+            retries_left--;
+            flaky = 1;
+            g_fail_count = 0;
+            timed_out = ct_run_body(t, 0, t->cases_gen ? t->cases_gen_count
+                                                       : t->cases_count, NULL);
+        }
+        ct_env_pop(t->spec.env);
+        {
+            it_t after_spec = t->spec;
+            after_spec.result = timed_out ? CT_TIMEOUT : (g_fail_count > 0 ? CT_FAIL : CT_PASS);
+            if (t->spec.teardown) t->spec.teardown(&after_spec);
+            ctest_after_each(&after_spec);
+        }        res.seconds = ct_now() - t0;
         if (timed_out) {
             res.status = CT_TIMEOUT;
         } else if (g_fail_count > 0) {
@@ -1863,16 +2121,19 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel) {
         }
         res.fail_count = g_fail_count > CT_MAX_FAILURES ? CT_MAX_FAILURES : g_fail_count;
         res.failures = g_failures;
+        res.flaky = flaky;
         R->result(&res);
         ct_case_descs_clear();
         if (timed_out) {
             timedout++;
+            ct_dep_note_failed(t->spec.name);
             if (o->fail_fast) break;
         } else if (g_fail_count > 0) {
             if (t->spec.known) {
                 known++;
             } else {
                 failed++;
+                ct_dep_note_failed(t->spec.name);
                 if (o->fail_fast) break;
             }
         } else {
@@ -1882,6 +2143,7 @@ static int ct_execute(const ct_opts *o, const size_t *sel, size_t nsel) {
     }
 
     ctest_teardown();
+    ct_dep_clear_failed();
 
     double t_end = ct_now();
     ctest_summary sum;
@@ -2033,11 +2295,12 @@ int ctest_run(int argc, char **argv) {
 #define CT_NOP_1(expr) ((void)(0 && (expr)))
 #define CT_NOP_2(expr, msg) ((void)(0 && (expr)))
 #define expect(...) CT_NCT_SELECT(__VA_ARGS__, CT_NOP_2, CT_NOP_1, 0)(__VA_ARGS__)
-#define expect_signal(sig, ...) ((void)(0 && (sig)))
-#define expect_abort(...) expect_signal(SIGABRT, __VA_ARGS__)
-#define expect_no_leak(block)    do block while (0)
-#define expect_no_alloc(block)   do block while (0)
-#define expect_no_overflow(src, block) do { unsigned char *arr = (unsigned char *)(void *)(src); do block while (0); } while (0)
+
+/* Stubs so test bodies still type-check when analysed without -DCTEST
+ * (e.g. by clangd / IDEs that index without compile_commands.json). */
+static unsigned char *ct_buf = (unsigned char *)0;
+static CT_UNUSED void ct_capture_stdout(void) { (void)0; }
+static CT_UNUSED const char *ct_captured(void) { return ""; }
 
 #endif
 
