@@ -1,6 +1,6 @@
 # c-test
 
-Single-header test framework for C99 and C++11. Works on GCC, Clang, and MSVC. No boilerplate, no test lists — just write tests.
+Single-header test framework for C99 and C++11. Works on GCC, Clang, TCC, and MSVC. No boilerplate, no test lists — just write tests.
 
 ```c
 #include "ctest.h"
