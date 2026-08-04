@@ -29,8 +29,8 @@
  * set below. Define a compatible `_POSIX_C_SOURCE` (or `_GNU_SOURCE`) of your
  * own before including this header to opt out.
  */
-#if !(defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
-#error "ctest requires GCC, Clang, or MSVC"
+#if !(defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER) || defined(__TINYC__))
+#error "ctest requires GCC, Clang, MSVC, or TCC"
 #endif
 
 #ifndef _MSC_VER
@@ -332,10 +332,10 @@ int main(int argc, char **argv) {
 #pragma section("ct_tst$z", read)
 #define CT_SECTION_NAME "ct_tst$b"
 #define CT_SECTION_MSVC 1
-#elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__))
+#elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__)) || defined(__TINYC__)
 #define CT_SECTION_NAME "ct_tst"
 #else
-#error "ctest requires GCC/Clang (ELF or Mach-O) or MSVC."
+#error "ctest requires GCC/Clang (ELF or Mach-O), MSVC, or TCC."
 #endif
 
 #define CT_MAX_FILTERS 8
@@ -607,7 +607,7 @@ extern const struct ctest_test *section$end$__DATA$ct_tst;
 /* Sentinel pointers at sub-section boundaries; the walker reads [start+1, stop). */
 __declspec(allocate("ct_tst$a")) static const struct ctest_test *ct_msvc_sec_start = NULL;
 __declspec(allocate("ct_tst$z")) static const struct ctest_test *ct_msvc_sec_stop  = NULL;
-#elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__))
+#elif defined(__ELF__) || (defined(__GNUC__) && !defined(__APPLE__)) || defined(__TINYC__)
 extern const struct ctest_test * const __start_ct_tst[];
 extern const struct ctest_test * const __stop_ct_tst[];
 #define CT_SEC_PTR_START (__start_ct_tst)

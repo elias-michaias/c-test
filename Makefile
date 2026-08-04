@@ -3,6 +3,7 @@
 #
 #   make run gcc        build with GCC  and run all tests
 #   make run clang      build with Clang and run all tests
+#   make run tcc        build with TCC  and run all tests
 #   make run msvc       build with MSVC (Wine) and run all tests
 #
 #   make run++ gcc      build C++ tests with g++ and run
@@ -87,6 +88,18 @@ _build_cxx_gcc: _ensure_dist
 
 _exec_cxx_gcc:
 	$(DIST)/c-test $(patsubst $(TEST_DIR)/%.cpp,$(DIST)/%,$(TEST_CXX_SRCS))
+
+# --- TCC -------------------------------------------------------------------
+_build_tcc: _ensure_dist
+	tcc -std=c99 $(DBGFLAG) -o $(DIST)/c-test ctest.c
+	@for src in $(TEST_SRCS); do \
+	    name=$$(basename $$src .c); \
+	    echo "  tcc $$name"; \
+	    tcc -std=c99 $(DBGFLAG) -I. -DCTEST -o $(DIST)/$$name $$src -ldl; \
+	done
+
+_exec_tcc:
+	$(DIST)/c-test $(patsubst $(TEST_DIR)/%.c,$(DIST)/%,$(TEST_SRCS))
 
 # --- Clang -----------------------------------------------------------------
 _build_clang: _ensure_dist
