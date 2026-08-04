@@ -2,19 +2,16 @@
 #define ctest_setup libtest_setup
 #define ctest_before_each libtest_before_each
 #define ctest_after_each libtest_after_each
-void libtest_setup(void);
-void libtest_before_each(void);
-void libtest_after_each(void);
+static int g_setup, g_before, g_after;
+void libtest_setup(void) { g_setup++; }
+void libtest_before_each(void) { g_before++; }
+void libtest_after_each(void) { g_after++; }
 #include "ctest.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static int g_setup, g_before, g_after;
 
-void libtest_setup(void) { g_setup++; }
-void libtest_before_each(void) { g_before++; }
-void libtest_after_each(void) { g_after++; }
 
 it("custom failure message", .tags = {"msg"})
 {
